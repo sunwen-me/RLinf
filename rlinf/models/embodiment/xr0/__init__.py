@@ -86,6 +86,7 @@ def get_model(
     num_action_chunks = getattr(cfg, "num_action_chunks", 30)
     num_steps = getattr(cfg, "num_steps", 5)
     noise_level = getattr(cfg, "noise_level", 0.5)
+    noise_method = getattr(cfg, "noise_method", "flow_sde")
 
     # XR0-specific config (with defaults matching the original XR0 config)
     xr0_cfg = getattr(cfg, "xr0", cfg)
@@ -122,11 +123,10 @@ def get_model(
         action_mean = np.array(stats["mean"], dtype=np.float32)
         action_std = np.array(stats["std"], dtype=np.float32)
 
-    # TODO: When add_value_head=True, initialize ValueHead and attach
-    # to policy. See lingbotvla __init__.py for reference pattern.
-    # from rlinf.models.embodiment.modules.value_head import ValueHead
-    # if getattr(cfg, "add_value_head", False):
-    #     policy.value_head = ValueHead(input_dim=dit_hidden_size, ...)
+    # Value head for PPO critic
+    add_value_head = getattr(cfg, "add_value_head", False) or getattr(
+        xr0_cfg, "add_value_head", False
+    )
 
     policy = XR0ForRLActionPrediction(
         xr0_model=xr0_model,
@@ -136,6 +136,9 @@ def get_model(
         action_mean=action_mean,
         action_std=action_std,
         noise_level=noise_level,
+        model_path=model_path if model_path != "dummy" else None,
+        add_value_head=add_value_head,
+        noise_method=noise_method,
     )
 
     return policy

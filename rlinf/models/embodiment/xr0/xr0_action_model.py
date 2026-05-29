@@ -32,6 +32,7 @@ from PIL import Image
 from transformers import AutoProcessor
 
 from rlinf.models.embodiment.base_policy import BasePolicy
+from rlinf.models.embodiment.modules.value_head import ValueHead
 from rlinf.utils.logging import get_logger
 
 from .utils import ACTION_DIM, denormalize_action, resize_image
@@ -71,6 +72,9 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         action_mean: Optional[np.ndarray] = None,
         action_std: Optional[np.ndarray] = None,
         noise_level: float = 0.5,
+        model_path: Optional[str] = None,
+        add_value_head: bool = False,
+        noise_method: str = "flow_sde",
     ):
         super().__init__()
         self.logger = get_logger()
@@ -80,6 +84,9 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         self.num_action_chunks = int(num_action_chunks)
         self.num_steps = int(num_steps)
         self.noise_level = float(noise_level)
+        self.model_path = model_path
+        self.add_value_head = add_value_head
+        self.noise_method = noise_method
 
         # Action normalization stats
         self.register_buffer(
@@ -94,6 +101,25 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         # Qwen3-VL processor (lazy-loaded on first use)
         self._processor = None
 
+        # Value head for PPO critic (uses VLM hidden states)
+        if add_value_head:
+            # Get VLM hidden size from model config
+            vlm_hidden_size = self._get_vlm_hidden_size()
+            self.value_head = ValueHead(
+                input_dim=vlm_hidden_size,
+                hidden_sizes=(512, 128),
+                output_dim=1,
+                activation="relu",
+                bias_last=True,
+            )
+            # Match VLM dtype (typically bfloat16)
+            vlm_dtype = self._get_vlm_dtype()
+            self.value_head = self.value_head.to(dtype=vlm_dtype)
+            self.logger.info(
+                "ValueHead initialized with input_dim=%d, dtype=%s",
+                vlm_hidden_size, vlm_dtype,
+            )
+
         # FSDP wrap name for every submodule
         for name, module in self.named_modules():
             path_parts = name.split(".")
@@ -105,10 +131,17 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
 
     @property
     def processor(self):
-        """Lazy-load Qwen3-VL processor on first access."""
+        """Lazy-load Qwen3-VL processor on first access.
+
+        Loads from model_path if available (local weights), otherwise
+        falls back to Qwen/Qwen3-VL-4B-Instruct from HuggingFace.
+        """
         if self._processor is None:
+            # Try loading from local model path first
+            source = self.model_path if self.model_path else "Qwen/Qwen3-VL-4B-Instruct"
+            self.logger.info("Loading processor from %s", source)
             self._processor = AutoProcessor.from_pretrained(
-                "Qwen/Qwen3-VL-4B-Instruct"
+                source, trust_remote_code=True
             )
             self._processor.tokenizer.padding_side = "right"
         return self._processor
@@ -130,6 +163,83 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             "action_projector",
             "action_output_layer",
         ]
+
+    # ------------------------------------------------------------------
+    # Value head helpers (for RL critic)
+    # ------------------------------------------------------------------
+
+    def _get_vlm_hidden_size(self) -> int:
+        """Get the hidden size of the VLM language model.
+
+        Returns:
+            Hidden dimension of the VLM's text backbone (e.g., 2560 for Qwen3-VL-4B).
+        """
+        # Try to get from VLM config
+        if hasattr(self.xr0_model, "vlm"):
+            vlm = self.xr0_model.vlm
+            config = vlm.config
+            # Qwen3VLConfig has text_config with hidden_size
+            if hasattr(config, "text_config"):
+                return config.text_config.hidden_size
+            # Direct config
+            if hasattr(config, "hidden_size"):
+                return config.hidden_size
+        # Fallback: try to infer from state_projector output
+        if hasattr(self.xr0_model, "state_projector"):
+            for module in self.xr0_model.state_projector.modules():
+                if hasattr(module, "out_features"):
+                    return module.out_features
+        # Default for Qwen3-VL-4B
+        return 2560
+
+    def _get_vlm_dtype(self) -> torch.dtype:
+        """Get the dtype of the VLM model.
+
+        Returns:
+            torch.dtype of the VLM parameters (e.g., torch.bfloat16).
+        """
+        if hasattr(self.xr0_model, "vlm"):
+            try:
+                return next(self.xr0_model.vlm.parameters()).dtype
+            except StopIteration:
+                pass
+        # Default to bfloat16 for XR0
+        return torch.bfloat16
+
+    def get_value_from_vlm(
+        self,
+        vlm_hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute value estimate from VLM hidden states.
+
+        Uses masked mean-pooling over the sequence dimension, then passes
+        through the value head MLP to produce a scalar value per batch.
+
+        Args:
+            vlm_hidden_states: ``(B, S, D)`` VLM output hidden states.
+            attention_mask: ``(B, S)`` attention mask (1 for valid, 0 for pad).
+
+        Returns:
+            ``(B,)`` value estimates.
+        """
+        # Masked mean-pooling: (B, S, D) -> (B, D)
+        mask = attention_mask.unsqueeze(-1).to(vlm_hidden_states.dtype)
+        sum_hidden = (vlm_hidden_states * mask).sum(dim=1)
+        valid_token_count = mask.sum(dim=1).clamp(min=1e-6)
+        pooled = sum_hidden / valid_token_count
+
+        # Ensure value_head is on the same device and dtype as input
+        device = pooled.device
+        dtype = pooled.dtype
+        if next(self.value_head.parameters()).device != device:
+            self.value_head = self.value_head.to(device)
+        if next(self.value_head.parameters()).dtype != dtype:
+            self.value_head = self.value_head.to(dtype=dtype)
+
+        # Value head: (B, D) -> (B, 1) -> (B,)
+        values = self.value_head(pooled).squeeze(-1)
+        return values
 
     # ------------------------------------------------------------------
     # Log-probability helpers (for RL training)
@@ -170,6 +280,96 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         return entropy
 
     # ------------------------------------------------------------------
+    # Flow-SDE denoising helpers
+    # ------------------------------------------------------------------
+
+    def _compute_denoise_step(
+        self,
+        x_t: torch.Tensor,
+        v_t: torch.Tensor,
+        timesteps: torch.Tensor,
+        idx: int,
+        mode: Literal["train", "eval"] = "train",
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute one denoising step with Flow-SDE noise.
+
+        Implements the ODE-to-SDE conversion for rectified flow:
+        - σ = a√(τ/(1-τ)) where a is noise_level, τ is current timestep
+        - Drift correction: σ²δ/(2τ) subtracted from x1 weight
+        - x_t_std = √δ · σ
+
+        Args:
+            x_t: Current noisy action ``(B, C, D)``.
+            v_t: Predicted velocity ``(B, C, D)``.
+            timesteps: Full timestep schedule ``(num_steps+1,)``.
+            idx: Current step index.
+            mode: ``"train"`` adds noise, ``"eval"`` is deterministic.
+
+        Returns:
+            Tuple of ``(x_t_mean, x_t_std, log_prob)``.
+        """
+        # Get the original dtype from x_t
+        orig_dtype = x_t.dtype
+
+        t_val = timesteps[idx]
+        delta = timesteps[idx] - timesteps[idx + 1]
+
+        # Expand for broadcasting: (B, C, D) - use x_t's dtype
+        t_input = t_val.view(1, 1, 1).expand_as(x_t).to(dtype=orig_dtype)
+        delta_input = delta.view(1, 1, 1).expand_as(x_t).to(dtype=orig_dtype)
+
+        # Predicted endpoints
+        x0_pred = x_t - v_t * t_input  # x0 = x_t - t·v_t
+        x1_pred = x_t + v_t * (1 - t_input)  # x1 = x_t + (1-t)·v_t
+
+        if mode == "eval":
+            # Deterministic: no noise
+            x0_weight = 1 - (t_input - delta_input)
+            x1_weight = t_input - delta_input
+            x_t_std = torch.zeros_like(x_t)
+        elif mode == "train":
+            if self.noise_method == "flow_sde":
+                # Flow-SDE: σ = a√(τ/(1-τ))
+                # Handle τ=1 edge case: use τ[1] instead of 1-τ=0
+                t_safe = torch.where(
+                    timesteps == 1.0, timesteps[1], timesteps
+                )
+                sigmas = self.noise_level * torch.sqrt(
+                    timesteps / (1 - t_safe)
+                )
+                # Remove the last element (τ=0)
+                sigmas = sigmas[:-1]
+                sigma_i = sigmas[idx].view(1, 1, 1).expand_as(x_t).to(dtype=orig_dtype)
+
+                # Weights with drift correction
+                x0_weight = 1 - (t_input - delta_input)
+                x1_weight = t_input - delta_input - (
+                    sigma_i**2 * delta_input / (2 * t_input)
+                )
+                x_t_std = torch.sqrt(delta_input) * sigma_i
+            else:
+                # Fallback: fixed noise (legacy behavior)
+                sigma = self.noise_level * math.sqrt(delta)
+                x0_weight = 1 - (t_input - delta_input)
+                x1_weight = t_input - delta_input
+                x_t_std = torch.full_like(x_t, sigma)
+
+        # Mean prediction
+        x_t_mean = x0_pred * x0_weight + x1_pred * x1_weight
+
+        # Log probability of the next state under N(x_t_mean, x_t_std)
+        if mode == "train" and self.noise_method == "flow_sde":
+            # Sample from the distribution
+            noise = torch.randn_like(x_t)
+            x_t_next = x_t_mean + noise * x_t_std
+            log_prob = self.get_logprob_norm(x_t_next, x_t_mean, x_t_std)
+        else:
+            x_t_next = x_t_mean
+            log_prob = torch.zeros_like(x_t)
+
+        return x_t_next, x_t_std, log_prob
+
+    # ------------------------------------------------------------------
     # Step-by-step denoising (for RL chain recording)
     # ------------------------------------------------------------------
 
@@ -207,12 +407,26 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             )
 
         # --- Real model: step-by-step denoising ---
-        # VLM forward to get KV-cache
+        # VLM forward to get KV-cache and hidden states
         vlm_inputs = {
             k: v.to(device) for k, v in vlm_batch.items() if isinstance(v, torch.Tensor)
         }
-        vlm_outputs = self.xr0_model.vlm(**vlm_inputs, use_cache=True)
+        vlm_outputs = self.xr0_model.vlm(
+            **vlm_inputs, use_cache=True, output_hidden_states=True
+        )
         past_key_values = list(vlm_outputs.past_key_values)
+
+        # Capture VLM hidden states for value computation
+        # Qwen3VLCausalLMOutputWithPast has hidden_states (tuple) not last_hidden_state
+        if hasattr(vlm_outputs, "hidden_states") and vlm_outputs.hidden_states is not None:
+            vlm_hidden_states = vlm_outputs.hidden_states[-1]  # Last layer hidden states
+        else:
+            # Fallback: use logits as proxy (should not happen with output_hidden_states=True)
+            vlm_hidden_states = vlm_outputs.logits
+        vlm_attention_mask = vlm_inputs.get(
+            "attention_mask",
+            torch.ones(batch_size, vlm_hidden_states.shape[1], device=device, dtype=torch.long),
+        )
 
         # Position ids for DiT (continue from VLM's last position)
         action_len = self.num_action_chunks
@@ -276,7 +490,8 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             1.0, 0.0, self.num_steps + 1, device=device
         )
 
-        # Pick one random step for stochastic gradient
+        # For Flow-SDE: pick one random step for policy gradient
+        # (all steps add noise, but only one step's logprob is used)
         if mode == "train":
             denoise_ind = random.randint(0, self.num_steps - 1)
         else:
@@ -289,48 +504,27 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         )
         chains = [x_t.detach().clone()]
         log_probs = []
-        values = []
 
         for idx in range(self.num_steps):
-            t_val = timesteps[idx].item()
-            delta = (timesteps[idx] - timesteps[idx + 1]).item()
+            t_val = timesteps[idx]
 
             # DiT forward: predict velocity
-            t_tensor = torch.full(
-                (batch_size, 1, 1), t_val, device=device, dtype=torch.bfloat16
-            )
+            t_tensor = t_val.view(1, 1, 1).expand(
+                batch_size, 1, 1
+            ).to(dtype=torch.bfloat16)
             v_t = self.xr0_model.dit_forward(
                 x_t, t_tensor, action_mask, state_embed,
                 position_embeds, past_key_values, attn_mask,
             )
 
-            # x0 prediction from velocity
-            x0_pred = x_t - v_t * t_tensor
-
-            # Deterministic mean for this step
-            w0 = 1 - t_val + delta
-            w1 = t_val - delta
-            x_t_mean = x0_pred * w0 + (x_t + v_t * (1 - t_val)) * w1
-
-            # Stochastic step (only at denoise_ind)
-            # TODO: Replace fixed sigma with learnable ExploreNoiseNet
-            # (π_RL Flow-Noise method). See lingbotvla for reference.
-            if mode == "train" and idx == denoise_ind:
-                sigma = self.noise_level * math.sqrt(delta)
-                x_t_std = torch.full_like(x_t, sigma)
-                noise = torch.randn_like(x_t)
-                x_t = x_t_mean + noise * x_t_std
-                log_prob = self.get_logprob_norm(x_t, x_t_mean, x_t_std)
-            else:
-                x_t_std = torch.zeros_like(x_t)
-                x_t = x_t_mean
-                log_prob = torch.zeros_like(x_t)
+            # Compute denoising step with Flow-SDE
+            step_mode = mode if idx == denoise_ind or mode == "eval" else "eval"
+            x_t, x_t_std, log_prob = self._compute_denoise_step(
+                x_t, v_t, timesteps, idx, mode=step_mode
+            )
 
             chains.append(x_t.detach().clone())
             log_probs.append(log_prob)
-            # TODO: Compute real value at each denoising step using
-            # ValueHead on DiT hidden states (see lingbotvla pattern).
-            values.append(torch.zeros(batch_size, device=device))
 
         # Aggregate: (B, num_steps+1, action_len, action_dim)
         chains_tensor = torch.stack(chains, dim=1)
@@ -342,9 +536,13 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         else:
             prev_logprobs = torch.zeros(batch_size, device=device)
 
-        # TODO: Aggregate per-step values into prev_values (see lingbotvla
-        # pattern: values = torch.stack(values, dim=1).mean(...)).
-        prev_values = torch.zeros(batch_size, device=device)
+        # Compute value from VLM hidden states
+        if self.add_value_head:
+            prev_values = self.get_value_from_vlm(
+                vlm_hidden_states.detach(), vlm_attention_mask.detach()
+            )
+        else:
+            prev_values = torch.zeros(batch_size, device=device)
 
         return {
             "actions": x_t[:, :action_len, : self.action_dim],
@@ -352,6 +550,8 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             "prev_logprobs": prev_logprobs,
             "prev_values": prev_values,
             "denoise_inds": torch.full((batch_size,), denoise_ind, dtype=torch.long),
+            "vlm_hidden_states": vlm_hidden_states.detach(),
+            "vlm_attention_mask": vlm_attention_mask.detach(),
         }
 
     def _sample_actions_stub(
@@ -456,6 +656,10 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         forward_inputs["action"] = torch.from_numpy(
             actions_np.reshape(batch_size, -1).astype(np.float32)
         )
+        # Store VLM hidden states for value computation in default_forward
+        if "vlm_hidden_states" in outputs:
+            forward_inputs["vlm_hidden_states"] = outputs["vlm_hidden_states"].cpu()
+            forward_inputs["vlm_attention_mask"] = outputs["vlm_attention_mask"].cpu()
 
         result = {
             "prev_logprobs": outputs["prev_logprobs"].cpu(),
@@ -491,8 +695,16 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         chains = forward_inputs.get("chains")  # (B, num_steps+1, C, D)
         denoise_inds = forward_inputs.get("denoise_inds")  # (B,)
 
+        def _compute_values(batch_size: int) -> torch.Tensor:
+            """Compute values from VLM hidden states if available."""
+            if self.add_value_head and "vlm_hidden_states" in forward_inputs:
+                vlm_hidden = forward_inputs["vlm_hidden_states"].to(device)
+                vlm_mask = forward_inputs["vlm_attention_mask"].to(device)
+                return self.get_value_from_vlm(vlm_hidden, vlm_mask)
+            return torch.zeros(batch_size, device=device)
+
         if chains is None or denoise_inds is None:
-            # TODO: This fallback should not happen in normal usage.
+            # This fallback should not happen in normal usage.
             # Indicates forward_inputs was not properly built.
             batch_size = 1
             for v in forward_inputs.values():
@@ -501,7 +713,7 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
                     break
             return {
                 "logprobs": torch.zeros(batch_size, device=device),
-                "values": torch.zeros(batch_size, device=device),
+                "values": _compute_values(batch_size).float(),
                 "entropy": torch.zeros(batch_size, device=device),
             }
 
@@ -509,21 +721,27 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         denoise_ind = int(denoise_inds[0].item())
 
         if denoise_ind < 0:
-            # Eval mode: no stochastic step, return zeros
+            # Eval mode: no stochastic step, return zeros for logprobs/entropy
             return {
                 "logprobs": torch.zeros(batch_size, device=device),
-                "values": torch.zeros(batch_size, device=device),
+                "values": _compute_values(batch_size).float(),
                 "entropy": torch.zeros(batch_size, device=device),
             }
 
         is_stub = hasattr(self.xr0_model, "generate")
 
         if is_stub:
-            # TODO: For stub model, return dummy logprobs/entropy.
-            # Real model replays the chain below.
+            # For stub model, return dummy logprobs/entropy.
+            # Compute values from VLM hidden states if available.
+            if self.add_value_head and "vlm_hidden_states" in forward_inputs:
+                vlm_hidden = forward_inputs["vlm_hidden_states"].to(device)
+                vlm_mask = forward_inputs["vlm_attention_mask"].to(device)
+                values = self.get_value_from_vlm(vlm_hidden, vlm_mask)
+            else:
+                values = torch.zeros(batch_size, device=device)
             return {
                 "logprobs": torch.zeros(batch_size, device=device),
-                "values": torch.zeros(batch_size, device=device),
+                "values": values.float(),
                 "entropy": torch.zeros(batch_size, device=device),
             }
 
@@ -605,25 +823,21 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         x_t = chains[:, denoise_ind]  # (B, C, D)
         x_next = chains[:, denoise_ind + 1]  # recorded next state
 
-        t_val = timesteps[denoise_ind].item()
-        delta = (timesteps[denoise_ind] - timesteps[denoise_ind + 1]).item()
+        t_val = timesteps[denoise_ind]
 
         # Current policy's velocity prediction
-        t_tensor = torch.full(
-            (batch_size, 1, 1), t_val, device=device, dtype=torch.bfloat16
-        )
+        t_tensor = t_val.view(1, 1, 1).expand(
+            batch_size, 1, 1
+        ).to(dtype=torch.bfloat16)
         v_t = self.xr0_model.dit_forward(
             x_t, t_tensor, action_mask, state_embed,
             position_embeds, past_key_values, attn_mask,
         )
 
-        # Current policy's mean and std
-        x0_pred = x_t - v_t * t_tensor
-        w0 = 1 - t_val + delta
-        w1 = t_val - delta
-        x_t_mean = x0_pred * w0 + (x_t + v_t * (1 - t_val)) * w1
-        sigma = self.noise_level * math.sqrt(delta)
-        x_t_std = torch.full_like(x_t, sigma)
+        # Compute mean and std using Flow-SDE
+        x_t_mean, x_t_std, _ = self._compute_denoise_step(
+            x_t, v_t, timesteps, denoise_ind, mode="train"
+        )
 
         # Log-prob of recorded next state under current policy
         logprobs = self.get_logprob_norm(x_next, x_t_mean, x_t_std)
@@ -633,16 +847,17 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         entropy = self.gaussian_entropy(x_t_std)
         entropy = entropy.mean(dim=[1, 2])  # (B,)
 
-        # Values (stub for now)
-        # TODO: Implement value head using ValueHead MLP from
-        # rlinf.models.embodiment.modules.value_head. Feed the DiT hidden
-        # states (or VLM prefix output) through value_head to get real
-        # value estimates for PPO critic.
-        values = torch.zeros(batch_size, device=device)
+        # Values from VLM hidden states (or stub zeros)
+        if self.add_value_head and "vlm_hidden_states" in forward_inputs:
+            vlm_hidden = forward_inputs["vlm_hidden_states"].to(device)
+            vlm_mask = forward_inputs["vlm_attention_mask"].to(device)
+            values = self.get_value_from_vlm(vlm_hidden, vlm_mask)
+        else:
+            values = torch.zeros(batch_size, device=device)
 
         return {
             "logprobs": logprobs.float(),
-            "values": values,
+            "values": values.float(),
             "entropy": entropy.float(),
         }
 
