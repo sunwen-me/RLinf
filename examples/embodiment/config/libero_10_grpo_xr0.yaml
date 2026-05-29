@@ -1,6 +1,3 @@
-# XR0 + LIBERO-10 GRPO training config (minimal test)
-# Usage: python examples/embodiment/train_embodied_agent.py --config-name libero_10_grpo_xr0
-
 defaults:
   - env/libero_10@env.train
   - env/libero_10@env.eval
@@ -19,24 +16,21 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor: all      # Actor on both GPUs (for FSDP sharding)
-    rollout: all    # Rollout on both GPUs
-    env: all        # Env can use both
+    actor,rollout,env: all
 
 runner:
   task_type: embodied
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "libero_10_grpo_xr0_test"
+    experiment_name: "libero_10_grpo_xr0"
     logger_backends: ["tensorboard"]
 
-  # Small test: just 2 epochs
-  max_epochs: 2
+  max_epochs: 2  # Small test
   max_steps: -1
 
   only_eval: False
-  val_check_interval: -1  # Disable eval for testing
+  val_check_interval: -1
   save_interval: 100
 
   resume_dir: null
@@ -45,8 +39,7 @@ runner:
 algorithm:
   normalize_advantages: True
   kl_penalty: kl
-  # Small group size for testing
-  group_size: 2  # GRPO requires group_size > 1
+  group_size: 2  # Small for testing
   reward_coef: 1.0
   rollout_epoch: 1
   eval_rollout_epoch: 1
@@ -74,7 +67,6 @@ algorithm:
   rewards_lower_bound: 0.1
   rewards_upper_bound: 0.9
 
-  # Sampling params
   sampling_params:
     do_sample: True
     temperature_train: 1.0
@@ -93,21 +85,21 @@ env:
   group_name: "EnvGroup"
 
   train:
-    total_num_envs: 4  # Must be divisible by group_size and pipeline_stage_num
+    total_num_envs: 4  # Must be divisible by group_size
     reward_coef: ${algorithm.reward_coef}
     group_size: ${algorithm.group_size}
-    max_episode_steps: 480
-    max_steps_per_rollout_epoch: 480  # Must be divisible by num_action_chunks (30)
+    max_episode_steps: 60
+    max_steps_per_rollout_epoch: 60
   eval:
-    total_num_envs: 2  # Small for testing
+    total_num_envs: 1
     auto_reset: True
     ignore_terminations: True
-    max_episode_steps: 480
-    max_steps_per_rollout_epoch: 480
+    max_episode_steps: 60
+    max_steps_per_rollout_epoch: 60
     group_size: 1
     is_eval: True
     video_cfg:
-      save_video: False  # Disable video for faster testing
+      save_video: False
       video_base_dir: ${runner.logger.log_path}/video/eval
 
 rollout:
@@ -115,38 +107,23 @@ rollout:
   generation_backend: "huggingface"
   recompute_logprobs: False
   unnorm_key: null
-  enable_offload: False
+  enable_offload: True
   pipeline_stage_num: 1
 
   model:
     model_path: "./models/Xiaomi-Robotics-0-LIBERO"
     precision: ${actor.model.precision}
-    # XR0 specific
-    model_type: "xr0"
-    action_dim: 32
-    num_action_chunks: 30
-    num_steps: 5
-    noise_method: "flow_sde"
-    noise_level: 0.5
 
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 1  # Minimal for testing
-  global_batch_size: 2  # Minimal for testing
+  micro_batch_size: 1
+  global_batch_size: 2
   seed: 42
-  enable_offload: False  # Disable - causes issues with XR0
+  enable_offload: True
 
   model:
     model_path: "./models/Xiaomi-Robotics-0-LIBERO"
-    model_type: "xr0"
-    precision: "bf16"
-    action_dim: 32
-    num_action_chunks: 30
-    num_steps: 5
-    add_value_head: False  # GRPO doesn't need value head
-    noise_method: "flow_sde"
-    noise_level: 0.5
 
   optim:
     lr: 5.0e-6
@@ -158,9 +135,8 @@ actor:
 
   fsdp_config:
     strategy: "fsdp"
-    sharding_strategy: "full_shard"  # Enable sharding to save memory
-    gradient_checkpointing: True  # Enable to save memory
-    cpu_offload: False  # Disable - causes issues with XR0
+    sharding_strategy: "full_shard"
+    gradient_checkpointing: True
     mixed_precision:
       param_dtype: ${actor.model.precision}
       reduce_dtype: ${actor.model.precision}
