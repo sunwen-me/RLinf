@@ -150,7 +150,7 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
     def _no_split_modules(self) -> list[str]:
         return [
             "DecoderLayer",
-            "Qwen3VLDecoderLayer",
+            "Qwen3VLTextDecoderLayer",
             "Qwen3VLVisionBlock",
         ]
 
