@@ -14,6 +14,11 @@ action_dim: 32
 num_action_chunks: 30
 num_steps: 5
 
+# Environment action dimension: slice model output to this many dims
+# before returning to env.  XR0 outputs 32D (bimanual) but LIBERO
+# expects 7D (right arm: ee_pos:3 + ee_aa:3 + gripper:1).
+action_env_dim: 7
+
 # LoRA settings (disabled by default)
 is_lora: False
 lora_rank: 32

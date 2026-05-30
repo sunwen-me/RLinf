@@ -75,6 +75,7 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         model_path: Optional[str] = None,
         add_value_head: bool = False,
         noise_method: str = "flow_sde",
+        action_env_dim: Optional[int] = None,
     ):
         super().__init__()
         self.logger = get_logger()
@@ -87,6 +88,11 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         self.model_path = model_path
         self.add_value_head = add_value_head
         self.noise_method = noise_method
+        # Environment action dimension: slice model output to this many dims
+        # before returning to the env worker.  e.g. XR0 outputs 32D (bimanual)
+        # but LIBERO expects 7D (right arm ee_pos:3 + ee_aa:3 + gripper:1).
+        # When None, uses action_dim (no slicing).
+        self.action_env_dim = int(action_env_dim) if action_env_dim else int(action_dim)
 
         # Action normalization stats
         self.register_buffer(
@@ -698,6 +704,7 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             if isinstance(v, torch.Tensor):
                 forward_inputs[k] = v.detach().cpu()
         forward_inputs["state"] = state_tensor.detach().cpu()
+        # Store full-dim action for training replay (chains are in full dim)
         forward_inputs["action"] = torch.from_numpy(
             actions_np.reshape(batch_size, -1).astype(np.float32)
         )
@@ -705,17 +712,29 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         if "vlm_hidden_states" in outputs:
             forward_inputs["vlm_hidden_states"] = outputs["vlm_hidden_states"].cpu()
             forward_inputs["vlm_attention_mask"] = outputs["vlm_attention_mask"].cpu()
+        # Slice actions to environment's expected dimension.
+        # XR0 outputs 32D (bimanual) but e.g. LIBERO expects 7D (right arm).
+        # The full 32D is preserved in forward_inputs for training replay.
+        env_actions_np = actions_np[:, :, : self.action_env_dim]
 
         result = {
             "prev_logprobs": outputs["prev_logprobs"].cpu(),
             "prev_values": outputs["prev_values"].cpu(),
             "forward_inputs": forward_inputs,
         }
-        return actions_np, result
+        return env_actions_np, result
 
     # ------------------------------------------------------------------
-    # Training-time: default_forward
+    # Training-time: forward / default_forward
     # ------------------------------------------------------------------
+
+    def forward(self, **kwargs: Any) -> dict[str, torch.Tensor]:
+        """Entry point called by the FSDP actor worker.
+
+        Delegates to ``default_forward`` so the actor can call
+        ``self.model(forward_inputs=..., ...)`` directly.
+        """
+        return self.default_forward(**kwargs)
 
     def default_forward(
         self,
@@ -793,20 +812,26 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         # --- Real model: replay the chain ---
         chains = chains.to(device)
 
-        # Rebuild VLM batch from stored inputs
+        state_tensor = forward_inputs.get("state")
+        if state_tensor is not None:
+            state_tensor = state_tensor.to(device)
+
+        # Re-run VLM forward to get current KV-cache and position ids.
+        # We rebuild the VLM batch from stored forward_inputs.
         vlm_keys = ["input_ids", "attention_mask", "pixel_values", "image_grid_thw"]
         vlm_batch = {}
         for k in vlm_keys:
             if k in forward_inputs:
                 vlm_batch[k] = forward_inputs[k].to(device)
 
-        state_tensor = forward_inputs.get("state")
-        if state_tensor is not None:
-            state_tensor = state_tensor.to(device)
-
-        # VLM forward to get current KV-cache
         vlm_outputs = self.xr0_model.vlm(**vlm_batch, use_cache=True)
         past_key_values = list(vlm_outputs.past_key_values)
+        vlm_pos_max = vlm_outputs.position_ids.max(dim=-1)[0]
+
+        cache_attn_mask = vlm_batch.get(
+            "attention_mask",
+            torch.ones(batch_size, 1, device=device, dtype=torch.long),
+        )
 
         # Build position ids and attention mask (same as sample_actions)
         action_len = self.num_action_chunks
@@ -816,15 +841,11 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             torch.arange(0, q_len, device=device)
             .view(1, 1, -1)
             .repeat(3, batch_size, 1)
-            + vlm_outputs.position_ids.max(dim=-1)[0][..., None]
+            + vlm_pos_max[..., None]
             + 1
         )
 
-        cache_mask = vlm_batch.get(
-            "attention_mask",
-            torch.ones(batch_size, 1, device=device, dtype=torch.long),
-        )
-        cache_mask = cache_mask[:, None, :].expand(-1, q_len, -1)
+        cache_mask = cache_attn_mask[:, None, :].expand(-1, q_len, -1)
 
         s_len = state_len + 1
         a_len = action_len

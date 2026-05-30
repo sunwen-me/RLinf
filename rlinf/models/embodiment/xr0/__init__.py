@@ -87,6 +87,7 @@ def get_model(
     num_steps = getattr(cfg, "num_steps", 5)
     noise_level = getattr(cfg, "noise_level", 0.5)
     noise_method = getattr(cfg, "noise_method", "flow_sde")
+    action_env_dim = getattr(cfg, "action_env_dim", None)
 
     # XR0-specific config (with defaults matching the original XR0 config)
     xr0_cfg = getattr(cfg, "xr0", cfg)
@@ -139,6 +140,7 @@ def get_model(
         model_path=model_path if model_path != "dummy" else None,
         add_value_head=add_value_head,
         noise_method=noise_method,
+        action_env_dim=action_env_dim,
     )
 
     return policy

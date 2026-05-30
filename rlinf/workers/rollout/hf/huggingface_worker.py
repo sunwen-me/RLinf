@@ -634,17 +634,93 @@ class MultiStepRolloutWorker(Worker):
         split_bootstrap_values = _split_optional_tensor(rollout_result.bootstrap_values)
         split_save_flags = _split_optional_tensor(rollout_result.save_flags)
         split_versions = _split_optional_tensor(rollout_result.versions)
-        split_forward_inputs = (
-            [{} for _ in sizes]
-            if not rollout_result.forward_inputs
-            else [
-                {
-                    key: torch.split(value, sizes, dim=0)[idx]
-                    for key, value in rollout_result.forward_inputs.items()
-                }
-                for idx in range(len(sizes))
-            ]
-        )
+
+        # Split forward_inputs, handling VLM-specific tensors that don't
+        # follow the standard (B, ...) layout.  In particular,
+        # ``pixel_values`` from Qwen3-VL has shape (total_patches, patch_dim)
+        # and must be split based on ``image_grid_thw`` rather than batch
+        # size.
+        if not rollout_result.forward_inputs:
+            split_forward_inputs = [{} for _ in sizes]
+        else:
+            fi = rollout_result.forward_inputs
+            grid_thw = fi.get("image_grid_thw")  # (B, 3)
+            pixel_values = fi.get("pixel_values")  # (total_patches, patch_dim)
+
+            # Pre-compute per-image patch counts from image_grid_thw and
+            # build cumulative boundaries for pixel_values splitting.
+            # This must happen before the loop so img_offset is computed
+            # once, not double-counted across keys.
+            cumsum: list[int] | None = None
+            pv_split: list[torch.Tensor] | None = None
+            grid_split: list[torch.Tensor] | None = None
+            if (
+                grid_thw is not None
+                and pixel_values is not None
+                and isinstance(grid_thw, torch.Tensor)
+                and isinstance(pixel_values, torch.Tensor)
+            ):
+                self.log_info(
+                    f"_split_rollout_result: pixel_values={pixel_values.shape}, "
+                    f"image_grid_thw={grid_thw.shape}, grid_thw_values={grid_thw}, sizes={sizes}"
+                )
+                patch_counts = grid_thw.prod(dim=-1).tolist()  # (B,)
+                acc = 0
+                cumsum = []
+                for c in patch_counts:
+                    acc += c
+                    cumsum.append(acc)
+
+                # Split pixel_values by per-image patch boundaries.
+                # Use .contiguous() since the VLM forward may require it.
+                pv_split = []
+                img_offset = 0
+                for sz in sizes:
+                    img_end = img_offset + sz
+                    pv_start = cumsum[img_offset - 1] if img_offset > 0 else 0
+                    pv_end = cumsum[img_end - 1]
+                    pv_split.append(pixel_values[pv_start:pv_end].contiguous())
+                    img_offset = img_end
+
+                # Split image_grid_thw by batch.
+                grid_split = list(torch.split(grid_thw, sizes, dim=0))
+
+            split_forward_inputs = [{} for _ in sizes]
+            for key, value in fi.items():
+                if not isinstance(value, torch.Tensor):
+                    # Non-tensor values: replicate to all shards.
+                    for idx in range(len(sizes)):
+                        split_forward_inputs[idx][key] = value
+                    continue
+
+                if key == "pixel_values" and pv_split is not None:
+                    for idx in range(len(sizes)):
+                        split_forward_inputs[idx][key] = pv_split[idx]
+                    self.log_info(f"  split pixel_values via pv_split: {[t.shape for t in pv_split]}")
+                elif key == "image_grid_thw" and grid_split is not None:
+                    for idx in range(len(sizes)):
+                        split_forward_inputs[idx][key] = grid_split[idx]
+                elif value.ndim == 0:
+                    # Scalar tensor (e.g. pkv_num_layers): replicate to all shards.
+                    for idx in range(len(sizes)):
+                        split_forward_inputs[idx][key] = value
+                elif value.shape[0] == sum(sizes):
+                    # Standard batch-dim-0 tensor.
+                    shards = torch.split(value, sizes, dim=0)
+                    for idx in range(len(sizes)):
+                        split_forward_inputs[idx][key] = shards[idx]
+                else:
+                    # Dim-0 doesn't match batch.  This shouldn't happen
+                    # for well-formed forward_inputs.  Replicate to all
+                    # shards so downstream code can still access it, but
+                    # warn so developers can investigate.
+                    self.log_warning(
+                        f"forward_inputs['{key}'] has shape {value.shape} "
+                        f"but expected dim-0 == {sum(sizes)}; "
+                        f"replicating to all shards"
+                    )
+                    for idx in range(len(sizes)):
+                        split_forward_inputs[idx][key] = value
 
         return [
             RolloutResult(
