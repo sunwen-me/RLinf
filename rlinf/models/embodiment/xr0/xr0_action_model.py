@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import math
 import random
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, Union
 
 import numpy as np
 import torch
@@ -240,6 +240,50 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         # Value head: (B, D) -> (B, 1) -> (B,)
         values = self.value_head(pooled).squeeze(-1)
         return values
+
+    # ------------------------------------------------------------------
+    # State dimension handling
+    # ------------------------------------------------------------------
+
+    def _get_expected_state_dim(self) -> int:
+        """Get the expected state dimension from the model's state_projector."""
+        if hasattr(self.xr0_model, "state_projector"):
+            # Get input dimension from the first linear layer
+            for module in self.xr0_model.state_projector.modules():
+                if isinstance(module, torch.nn.Linear):
+                    return module.in_features
+        # Default XR0 state dimension
+        return 32
+
+    def _pad_state(self, state: torch.Tensor) -> torch.Tensor:
+        """Pad or truncate state to match model's expected dimension.
+
+        This handles different environments producing different state dims:
+        - LIBERO: 8D (eef_pos:3 + eef_quat:3 + gripper:2)
+        - ManiSkill: 32D
+        - etc.
+
+        Args:
+            state: (B, 1, D) state tensor from environment
+
+        Returns:
+            (B, 1, expected_D) state tensor padded/truncated to model's expected dim
+        """
+        expected_dim = self._get_expected_state_dim()
+        current_dim = state.shape[-1]
+
+        if current_dim == expected_dim:
+            return state
+        elif current_dim < expected_dim:
+            # Pad with zeros
+            padding = torch.zeros(
+                *state.shape[:-1], expected_dim - current_dim,
+                device=state.device, dtype=state.dtype
+            )
+            return torch.cat([state, padding], dim=-1)
+        else:
+            # Truncate
+            return state[..., :expected_dim]
 
     # ------------------------------------------------------------------
     # Log-probability helpers (for RL training)
@@ -467,9 +511,10 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             [cache_mask, causal_mask[None].expand(batch_size, -1, -1)], dim=-1
         )[:, None].bool()
 
-        # State embedding
+        # State embedding (pad/truncate to match model's expected dim)
+        state_tensor_padded = self._pad_state(state_tensor)
         state_embed = self.xr0_model.state_projector(
-            state_tensor.to(device=device, dtype=torch.bfloat16)
+            state_tensor_padded.to(device=device, dtype=torch.bfloat16)
         )
 
         # Position embeddings (RoPE)
@@ -800,8 +845,10 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             [cache_mask, causal_mask[None].expand(batch_size, -1, -1)], dim=-1
         )[:, None].bool()
 
+        # State embedding (pad/truncate to match model's expected dim)
+        state_tensor_padded = self._pad_state(state_tensor)
         state_embed = self.xr0_model.state_projector(
-            state_tensor.to(dtype=torch.bfloat16)
+            state_tensor_padded.to(dtype=torch.bfloat16)
         )
 
         dummy_action = torch.zeros(
@@ -867,14 +914,19 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
 
     def _build_vlm_batch(
         self,
-        images: np.ndarray,
+        images: Union[np.ndarray, torch.Tensor],
         task_descriptions: list[str],
         state_tensor: torch.Tensor,
         device: torch.device,
     ) -> dict[str, torch.Tensor]:
         """Convert env observations to Qwen3-VL processor format."""
         pil_images = []
-        for img_np in images:
+        for img in images:
+            # Handle both Tensor and numpy array inputs
+            if isinstance(img, torch.Tensor):
+                img_np = img.detach().cpu().numpy()
+            else:
+                img_np = img
             pil_img = Image.fromarray(img_np.astype(np.uint8))
             pil_img = resize_image(pil_img, factor=32, max_pixels=90000)
             pil_images.append(pil_img)

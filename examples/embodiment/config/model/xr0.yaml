@@ -39,7 +39,7 @@ noise_level: 0.5
 
 # XR0-specific config
 xr0:
-  state_shape: [1, 32]
+  state_shape: [1, 8]  # LIBERO uses 8-dim state (eef_pos:3 + eef_quat:3 + gripper:2)
   action_shape: [30, 32]
   dit_num_layers: 16
   dit_hidden_size: 1024
