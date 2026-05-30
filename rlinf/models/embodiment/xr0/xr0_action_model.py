@@ -457,13 +457,25 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             )
 
         # --- Real model: step-by-step denoising ---
-        # VLM forward to get KV-cache and hidden states
+        # VLM forward to get KV-cache and hidden states.
+        # Temporarily disable gradient checkpointing on ALL VLM sub-modules
+        # so the @check_model_inputs decorator does not force use_cache=False.
         vlm_inputs = {
             k: v.to(device) for k, v in vlm_batch.items() if isinstance(v, torch.Tensor)
         }
-        vlm_outputs = self.xr0_model.vlm(
-            **vlm_inputs, use_cache=True, output_hidden_states=True
-        )
+        vlm_module = self.xr0_model.vlm
+        gc_states: list[tuple[torch.nn.Module, bool]] = []
+        for module in vlm_module.modules():
+            if getattr(module, "gradient_checkpointing", False):
+                gc_states.append((module, True))
+                module.gradient_checkpointing = False
+        try:
+            vlm_outputs = vlm_module(
+                **vlm_inputs, use_cache=True, output_hidden_states=True
+            )
+        finally:
+            for module, state in gc_states:
+                module.gradient_checkpointing = state
         past_key_values = list(vlm_outputs.past_key_values)
 
         # Capture VLM hidden states for value computation
@@ -581,11 +593,15 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         chains_tensor = torch.stack(chains, dim=1)
         log_probs_tensor = torch.stack(log_probs, dim=1)
 
-        # Pick logprob at the chosen denoise step, average over action dims
+        # Pick logprob at the chosen denoise step.
+        # Return shape (B, num_action_chunks, action_dim) so that
+        # preprocess_loss_inputs can reshape/aggregate as needed.
         if denoise_ind >= 0:
-            prev_logprobs = log_probs_tensor[:, denoise_ind].mean(dim=[1, 2])
+            prev_logprobs = log_probs_tensor[:, denoise_ind]  # (B, C, D)
         else:
-            prev_logprobs = torch.zeros(batch_size, device=device)
+            prev_logprobs = torch.zeros(
+                batch_size, action_len, self.action_dim, device=device
+            )
 
         # Compute value from VLM hidden states
         if self.add_value_head:
@@ -824,7 +840,30 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             if k in forward_inputs:
                 vlm_batch[k] = forward_inputs[k].to(device)
 
-        vlm_outputs = self.xr0_model.vlm(**vlm_batch, use_cache=True)
+        # Run the VLM forward under torch.no_grad() and with gradient
+        # checkpointing disabled.  We only need the KV cache for the DiT;
+        # gradients flow only through the DiT, not the VLM.  Running with
+        # no_grad prevents FSDP from resharding VLM parameters after the
+        # forward (which would cause storage-of-size-0 errors during the
+        # backward through the DiT's attention that references the cache).
+        vlm_module = self.xr0_model.vlm
+        gc_states: list[tuple[torch.nn.Module, bool]] = []
+        for module in vlm_module.modules():
+            if getattr(module, "gradient_checkpointing", False):
+                gc_states.append((module, True))
+                module.gradient_checkpointing = False
+        try:
+            with torch.no_grad():
+                vlm_outputs = vlm_module(**vlm_batch, use_cache=True)
+        finally:
+            for module, state in gc_states:
+                module.gradient_checkpointing = state
+
+        if vlm_outputs.past_key_values is None:
+            self.logger.error(
+                "VLM past_key_values is None even after disabling gradient "
+                "checkpointing. The KV cache will not be available for DiT."
+            )
         past_key_values = list(vlm_outputs.past_key_values)
         vlm_pos_max = vlm_outputs.position_ids.max(dim=-1)[0]
 
@@ -907,13 +946,15 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             x_t, v_t, timesteps, denoise_ind, mode="train"
         )
 
-        # Log-prob of recorded next state under current policy
+        # Log-prob of recorded next state under current policy.
+        # Return shape (B, num_action_chunks, action_dim) so that
+        # preprocess_loss_inputs can reshape/aggregate as needed.
         logprobs = self.get_logprob_norm(x_next, x_t_mean, x_t_std)
-        logprobs = logprobs.mean(dim=[1, 2])  # (B,)
+        # logprobs: (B, C, D) — keep all dims for the loss function.
 
-        # Entropy
+        # Entropy: same shape as logprobs.
         entropy = self.gaussian_entropy(x_t_std)
-        entropy = entropy.mean(dim=[1, 2])  # (B,)
+        # entropy: (B, C, D) — keep all dims for the loss function.
 
         # Values from VLM hidden states (or stub zeros)
         if self.add_value_head and "vlm_hidden_states" in forward_inputs:
