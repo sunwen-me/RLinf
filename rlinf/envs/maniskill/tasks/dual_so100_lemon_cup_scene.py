@@ -194,7 +194,7 @@ class DualSO100LemonCupScene(BaseEnv):
     def _default_sensor_configs(self):
         ego_pose = sapien_utils.look_at([-0.35, 0.0, 0.55], [-0.10, 0.0, 0.0])
         return [
-            CameraConfig("ego", ego_pose, 128, 128, np.pi / 2, 0.01, 100),
+            CameraConfig("base_camera", ego_pose, 128, 128, np.pi / 2, 0.01, 100),
         ]
 
     @property
@@ -520,6 +520,17 @@ class DualSO100LemonCupScene(BaseEnv):
     # ------------------------------------------------------------------
 
     def step(self, action):
+        # RLinf env worker sends flat array/tensor (B, 12), but MultiAgent needs dict.
+        # Split flat action into per-agent dict: left 6D + right 6D.
+        if not isinstance(action, dict):
+            action_dim = action.shape[-1]
+            if action_dim == 12:
+                left_uid = self.agent.agents[0].uid + "-0"
+                right_uid = self.agent.agents[1].uid + "-1"
+                action = {
+                    left_uid: action[..., :6],
+                    right_uid: action[..., 6:],
+                }
         obs, reward, terminated, truncated, info = super().step(action)
         self._update_camera_markers()
         return obs, reward, terminated, truncated, info

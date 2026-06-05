@@ -16,6 +16,9 @@ model_path: "dummy"
 # Precision used by RLinf actor/rollout wrappers
 precision: "bf16"
 
+# Policy setup: used by config.py to determine ManiSkill control_mode
+policy_setup: "so101_wristcam"
+
 # Action/chunk settings
 action_dim: 32
 num_action_chunks: 30

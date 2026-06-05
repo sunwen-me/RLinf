@@ -666,9 +666,12 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         return {
             "actions": actions,
             "chains": chains_tensor,
-            # TODO: For stub, prev_logprobs/prev_values are zeros.
-            # Real model will compute these from the chain.
-            "prev_logprobs": torch.zeros(batch_size, device=device),
+            # Stub: return zeros with correct shapes matching the real model.
+            # prev_logprobs: (B, C, D) so preprocess_loss_inputs can reshape.
+            # prev_values: (B,) scalar per sample.
+            "prev_logprobs": torch.zeros(
+                batch_size, action_len, self.action_dim, device=device
+            ),
             "prev_values": torch.zeros(batch_size, device=device),
             "denoise_inds": torch.full(
                 (batch_size,), denoise_ind, dtype=torch.long
@@ -698,7 +701,7 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
 
         images = env_obs["main_images"]
         states = env_obs["states"]
-        task_descriptions = env_obs.get("task_descriptions", [""] * len(images))
+        task_descriptions = env_obs.get("task_descriptions") or [""] * len(images)
         batch_size = len(images)
 
         # State tensor: (B, 1, STATE_DIM)
@@ -812,9 +815,9 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
                     batch_size = v.shape[0]
                     break
             return {
-                "logprobs": torch.zeros(batch_size, device=device),
+                "logprobs": torch.zeros(batch_size, self.num_action_chunks, self.action_dim, device=device),
                 "values": _compute_values(batch_size).float(),
-                "entropy": torch.zeros(batch_size, device=device),
+                "entropy": torch.zeros(batch_size, self.num_action_chunks, self.action_dim, device=device),
             }
 
         batch_size = chains.shape[0]
@@ -823,15 +826,15 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         if denoise_ind < 0:
             # Eval mode: no stochastic step, return zeros for logprobs/entropy
             return {
-                "logprobs": torch.zeros(batch_size, device=device),
+                "logprobs": torch.zeros(batch_size, self.num_action_chunks, self.action_dim, device=device),
                 "values": _compute_values(batch_size).float(),
-                "entropy": torch.zeros(batch_size, device=device),
+                "entropy": torch.zeros(batch_size, self.num_action_chunks, self.action_dim, device=device),
             }
 
         is_stub = hasattr(self.xr0_model, "generate")
 
         if is_stub:
-            # For stub model, return dummy logprobs/entropy.
+            # For stub model, return dummy logprobs/entropy with correct shape.
             # Compute values from VLM hidden states if available.
             if self.add_value_head and "vlm_hidden_states" in forward_inputs:
                 vlm_hidden = forward_inputs["vlm_hidden_states"].to(device)
@@ -840,9 +843,9 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             else:
                 values = torch.zeros(batch_size, device=device)
             return {
-                "logprobs": torch.zeros(batch_size, device=device),
+                "logprobs": torch.zeros(batch_size, self.num_action_chunks, self.action_dim, device=device),
                 "values": values.float(),
-                "entropy": torch.zeros(batch_size, device=device),
+                "entropy": torch.zeros(batch_size, self.num_action_chunks, self.action_dim, device=device),
             }
 
         # --- Real model: replay the chain ---
