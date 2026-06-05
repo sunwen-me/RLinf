@@ -120,7 +120,7 @@ rollout:
   pipeline_stage_num: 1
 
   model:
-    model_path: "./models/Xiaomi-Robotics-0-LIBERO"
+    model_path: "/root/Xiaomi-Robotics-0/Xiaomi-Robotics-0-Pretrain"
     precision: ${actor.model.precision}
 
 actor:
@@ -132,7 +132,7 @@ actor:
   enable_offload: True
 
   model:
-    model_path: "./models/Xiaomi-Robotics-0-LIBERO"
+    model_path: "/root/Xiaomi-Robotics-0/Xiaomi-Robotics-0-Pretrain"
 
   optim:
     lr: 5.0e-6

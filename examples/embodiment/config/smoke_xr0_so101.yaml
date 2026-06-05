@@ -34,7 +34,7 @@ runner:
 
   only_eval: False
   val_check_interval: -1
-  save_interval: 999
+  save_interval: 99999
 
   resume_dir: null
   ckpt_path: null
@@ -114,7 +114,7 @@ rollout:
   pipeline_stage_num: 1
 
   model:
-    model_path: "./models/Xiaomi-Robotics-0-LIBERO"
+    model_path: "/root/Xiaomi-Robotics-0/Xiaomi-Robotics-0-Pretrain"
     precision: ${actor.model.precision}
 
 actor:
@@ -126,7 +126,17 @@ actor:
   enable_offload: True
 
   model:
-    model_path: "./models/Xiaomi-Robotics-0-LIBERO"
+    model_path: "/root/Xiaomi-Robotics-0/Xiaomi-Robotics-0-Pretrain"
+    action_dim: 32
+    num_action_chunks: 30
+    num_steps: 5
+    action_env_dim: 12
+    noise_level: 0.5
+    add_value_head: False
+    policy_setup: "so101_wristcam"
+    precision: "bf16"
+    action_mapping:
+      preset: "so101_dual"
 
   optim:
     lr: 5.0e-6

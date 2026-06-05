@@ -10,8 +10,8 @@
 
 model_type: "xr0"
 
-# Path to XR0 checkpoint (set to "dummy" for skeleton/testing without weights)
-model_path: "dummy"
+# Path to XR0 pretrained checkpoint
+model_path: "/root/Xiaomi-Robotics-0/Xiaomi-Robotics-0-Pretrain"
 
 # Precision used by RLinf actor/rollout wrappers
 precision: "bf16"
