@@ -28,6 +28,10 @@ def prepare_actions_for_maniskill(
 ) -> torch.Tensor:
     if "panda" in policy:
         return raw_chunk_actions
+    if "so101" in policy or "so100" in policy:
+        # Dual-arm SO100/SO101: 6D per arm (5 joints + 1 gripper), 12D total
+        # Pass through directly — ManiSkill controller handles the rest
+        return raw_chunk_actions
     # TODO only suitable for action_dim = 7
     reshaped_actions = raw_chunk_actions.reshape(-1, action_dim)
     batch_size = reshaped_actions.shape[0]

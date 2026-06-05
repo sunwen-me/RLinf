@@ -1,0 +1,66 @@
+# XR0 VLA model config for SO101 dual-arm environment.
+# XR0: Qwen3-VL backbone + DiT action head with rectified flow.
+#
+# Action mapping: XR0 32D -> SO101 12D
+#   SO101 left 6D  = [XR0[7], XR0[8], XR0[9], XR0[10], XR0[11], XR0[6]]
+#                     ───────── 5 arm joints ─────────     gripper
+#   SO101 right 6D = [XR0[21], XR0[22], XR0[23], XR0[24], XR0[25], XR0[20]]
+#                     ───────── 5 arm joints ─────────     gripper
+#   Discard: XR0[12], XR0[13], XR0[26], XR0[27:32]
+
+model_type: "xr0"
+
+# Path to XR0 checkpoint (set to "dummy" for skeleton/testing without weights)
+model_path: "dummy"
+
+# Precision used by RLinf actor/rollout wrappers
+precision: "bf16"
+
+# Action/chunk settings
+action_dim: 32
+num_action_chunks: 30
+num_steps: 5
+
+# Environment action dimension: 12D for SO101 dual-arm
+# (overridden by action_mapper if present)
+action_env_dim: 12
+
+# Action mapping: XR0 32D -> SO101 12D
+# Uses "so101_dual" preset which maps:
+#   left:  arm joints [7:12] + gripper [6]
+#   right: arm joints [21:26] + gripper [20]
+action_mapping:
+  preset: "so101_dual"
+
+# LoRA settings (disabled by default)
+is_lora: False
+lora_rank: 32
+
+# Common embodied fields
+use_prio: True
+
+# RL head behavior
+# For GRPO actor-only: False; for PPO actor_critic: True
+add_value_head: False
+
+# Optional flags
+trust_remote_code: True
+low_cpu_mem_usage: True
+
+# Action normalization stats (optional)
+stats_path: null
+unnorm_key: null
+
+# Flow-matching noise level for RL training (higher = more exploration)
+noise_level: 0.5
+
+# XR0-specific config
+xr0:
+  state_shape: [1, 32]  # SO101 state padded to 32D
+  action_shape: [30, 32]
+  dit_num_layers: 16
+  dit_hidden_size: 1024
+  local_window: 4
+  training_repeat: 4
+  enable_freq: false
+  flow_sampling: "beta"

@@ -921,6 +921,8 @@ def validate_embodied_cfg(cfg):
                     return "arm_pd_ee_target_delta_pose_align2_gripper_pd_joint_pos"
                 elif "panda" in robot:
                     return "pd_ee_body_target_delta_pose_real_root_frame"
+                elif "so101" in robot or "so100" in robot:
+                    return "pd_joint_delta_pos"
                 else:
                     raise NotImplementedError(f"Robot {robot} not supported")
 

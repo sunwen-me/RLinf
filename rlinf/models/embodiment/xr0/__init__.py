@@ -27,6 +27,7 @@ from omegaconf import DictConfig
 
 from rlinf.utils.logging import get_logger
 
+from .action_mapping import ActionMapper, get_action_mapper
 from .utils import ACTION_DIM
 from .xr0_action_model import XR0ForRLActionPrediction
 
@@ -129,6 +130,26 @@ def get_model(
         xr0_cfg, "add_value_head", False
     )
 
+    # Action mapper: maps between model's 32D space and env action space
+    # with valid_action_mask for loss masking.
+    action_mapper = None
+    mapping_cfg = getattr(cfg, "action_mapping", None) or getattr(
+        xr0_cfg, "action_mapping", None
+    )
+    if mapping_cfg is not None:
+        mapping_cfg = dict(mapping_cfg)
+        preset = mapping_cfg.pop("preset", None)
+        indices = mapping_cfg.pop("env_action_indices", None)
+        action_mapper = get_action_mapper(
+            model_action_dim=action_dim,
+            preset=preset,
+            env_action_indices=indices,
+        )
+        logger.info(
+            "ActionMapper: preset=%s, env_action_dim=%d, valid dims=%s",
+            preset, action_mapper.env_action_dim, action_mapper.env_action_indices,
+        )
+
     policy = XR0ForRLActionPrediction(
         xr0_model=xr0_model,
         action_dim=action_dim,
@@ -141,6 +162,7 @@ def get_model(
         add_value_head=add_value_head,
         noise_method=noise_method,
         action_env_dim=action_env_dim,
+        action_mapper=action_mapper,
     )
 
     return policy

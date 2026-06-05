@@ -35,6 +35,7 @@ from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.models.embodiment.modules.value_head import ValueHead
 from rlinf.utils.logging import get_logger
 
+from .action_mapping import ActionMapper, get_action_mapper
 from .utils import ACTION_DIM, denormalize_action, resize_image
 
 
@@ -76,6 +77,7 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         add_value_head: bool = False,
         noise_method: str = "flow_sde",
         action_env_dim: Optional[int] = None,
+        action_mapper: Optional[ActionMapper] = None,
     ):
         super().__init__()
         self.logger = get_logger()
@@ -88,11 +90,16 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         self.model_path = model_path
         self.add_value_head = add_value_head
         self.noise_method = noise_method
-        # Environment action dimension: slice model output to this many dims
-        # before returning to the env worker.  e.g. XR0 outputs 32D (bimanual)
-        # but LIBERO expects 7D (right arm ee_pos:3 + ee_aa:3 + gripper:1).
-        # When None, uses action_dim (no slicing).
-        self.action_env_dim = int(action_env_dim) if action_env_dim else int(action_dim)
+
+        # Action mapper: handles 32D <-> env_dim conversion with valid_action_mask.
+        # Takes precedence over action_env_dim (simple slicing).
+        if action_mapper is not None:
+            self.action_mapper = action_mapper
+            self.action_env_dim = action_mapper.env_action_dim
+        else:
+            self.action_mapper = None
+            # Fallback: simple slicing to first N dims
+            self.action_env_dim = int(action_env_dim) if action_env_dim else int(action_dim)
 
         # Action normalization stats
         self.register_buffer(
@@ -603,6 +610,13 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
                 batch_size, action_len, self.action_dim, device=device
             )
 
+        # Apply valid_action_mask to prev_logprobs so that stored old_logprobs
+        # are consistent with the masked logprobs in default_forward.
+        # This ensures the PPO ratio exp(logprobs - old_logprobs) only sees
+        # valid action dimensions.
+        if self.action_mapper is not None:
+            prev_logprobs = self.action_mapper.apply_mask(prev_logprobs)
+
         # Compute value from VLM hidden states
         if self.add_value_head:
             prev_values = self.get_value_from_vlm(
@@ -728,10 +742,16 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         if "vlm_hidden_states" in outputs:
             forward_inputs["vlm_hidden_states"] = outputs["vlm_hidden_states"].cpu()
             forward_inputs["vlm_attention_mask"] = outputs["vlm_attention_mask"].cpu()
-        # Slice actions to environment's expected dimension.
-        # XR0 outputs 32D (bimanual) but e.g. LIBERO expects 7D (right arm).
+        # Slice/gather actions to environment's expected dimension.
+        # XR0 outputs 32D (bimanual) but e.g. LIBERO expects 7D (right arm),
+        # SO101 expects 12D (5 joints + gripper per arm).
         # The full 32D is preserved in forward_inputs for training replay.
-        env_actions_np = actions_np[:, :, : self.action_env_dim]
+        if self.action_mapper is not None:
+            actions_tensor = torch.from_numpy(actions_np)
+            env_actions_tensor = self.action_mapper.map_to_env(actions_tensor)
+            env_actions_np = env_actions_tensor.numpy()
+        else:
+            env_actions_np = actions_np[:, :, : self.action_env_dim]
 
         result = {
             "prev_logprobs": outputs["prev_logprobs"].cpu(),
@@ -955,6 +975,14 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         # Entropy: same shape as logprobs.
         entropy = self.gaussian_entropy(x_t_std)
         # entropy: (B, C, D) — keep all dims for the loss function.
+
+        # Apply valid_action_mask: zero out invalid action dimensions so that
+        # logprob aggregation (sum over action_dim) and entropy computation
+        # only use the dimensions that the environment actually consumes.
+        # This prevents e.g. XR0's 20 unused dims from polluting the loss.
+        if self.action_mapper is not None:
+            logprobs = self.action_mapper.apply_mask(logprobs)
+            entropy = self.action_mapper.apply_mask(entropy)
 
         # Values from VLM hidden states (or stub zeros)
         if self.add_value_head and "vlm_hidden_states" in forward_inputs:
