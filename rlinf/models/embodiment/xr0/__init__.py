@@ -153,6 +153,10 @@ def get_model(
             preset, action_mapper.env_action_dim, action_mapper.env_action_indices,
         )
 
+    train_expert_only = getattr(cfg, "train_expert_only", False) or getattr(
+        xr0_cfg, "train_expert_only", False
+    )
+
     policy = XR0ForRLActionPrediction(
         xr0_model=xr0_model,
         action_dim=action_dim,
@@ -166,6 +170,7 @@ def get_model(
         noise_method=noise_method,
         action_env_dim=action_env_dim,
         action_mapper=action_mapper,
+        train_expert_only=train_expert_only,
     )
 
     return policy

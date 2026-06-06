@@ -96,6 +96,7 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         noise_method: str = "flow_sde",
         action_env_dim: Optional[int] = None,
         action_mapper: Optional[ActionMapper] = None,
+        train_expert_only: bool = False,
     ):
         super().__init__()
         self.logger = get_logger()
@@ -118,6 +119,11 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             self.action_mapper = None
             # Fallback: simple slicing to first N dims
             self.action_env_dim = int(action_env_dim) if action_env_dim else int(action_dim)
+
+        # Freeze VLM backbone when train_expert_only (like pi0/pi0.5/lingbotvla).
+        self.train_expert_only = train_expert_only
+        if train_expert_only:
+            self.freeze_vlm()
 
         # Action normalization stats
         self.register_buffer(
@@ -223,6 +229,32 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         if pos_max.ndim == 2 and pos_max.shape[0] == batch_size and pos_max.shape[1] == 3:
             return pos_max.transpose(0, 1).contiguous()
         return pos_max
+
+    def freeze_vlm(self):
+        """Freeze the VLM backbone (Qwen3-VL), only train DiT + projectors.
+
+        Follows the pi0/pi0.5/lingbotvla pattern: train_expert_only freezes
+        the vision-language model and only trains the action prediction head.
+        """
+        vlm = self.xr0_model.vlm
+        vlm.eval()
+        vlm_params = 0
+        for param in vlm.parameters():
+            param.requires_grad = False
+            vlm_params += param.numel()
+        self.logger.info(
+            "[freeze_vlm] Frozen VLM (Qwen3-VL): %.1fM params", vlm_params / 1e6
+        )
+
+        # Log trainable params
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in self.parameters())
+        self.logger.info(
+            "[freeze_vlm] Trainable: %.1fM / %.1fB (%.1f%%)",
+            trainable_params / 1e6,
+            total_params / 1e9,
+            trainable_params / total_params * 100,
+        )
 
     @property
     def processor(self):

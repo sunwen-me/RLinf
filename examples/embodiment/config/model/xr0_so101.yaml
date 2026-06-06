@@ -46,6 +46,10 @@ use_prio: True
 # For GRPO actor-only: False; for PPO actor_critic: True
 add_value_head: False
 
+# Freeze VLM backbone (Qwen3-VL), only train DiT + projectors.
+# Follows pi0/pi0.5/lingbotvla pattern: ~270M trainable out of 4.7B total.
+train_expert_only: True
+
 # Optional flags
 trust_remote_code: True
 low_cpu_mem_usage: True
