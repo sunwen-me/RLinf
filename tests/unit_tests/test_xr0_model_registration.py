@@ -105,6 +105,8 @@ def test_xr0_default_forward_returns_stub():
     assert "logprobs" in result
     assert "values" in result
     assert "entropy" in result
-    assert result["logprobs"].shape == (1,)
+    # After commit e637c186, logprobs/entropy return full (B, C, D) shape
+    # so loss functions can do their own aggregation.
+    assert result["logprobs"].shape == (1, 30, 32)
     assert result["values"].shape == (1,)
-    assert result["entropy"].shape == (1,)
+    assert result["entropy"].shape == (1, 30, 32)

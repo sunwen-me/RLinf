@@ -106,6 +106,9 @@ def process_nested_dict_for_adv(nested_dict, rollout_epoch):
             ret_dict[key] = new_value
         elif isinstance(value, dict):
             ret_dict[key] = process_nested_dict_for_adv(value, rollout_epoch)
+        elif value is not None and key not in ret_dict:
+            # Pass through non-tensor values (e.g. VLM KV cache).
+            ret_dict[key] = value
     return ret_dict
 
 
@@ -122,6 +125,9 @@ def process_nested_dict_for_train(nested_dict, shuffle_id):
             ret_dict[key] = value.reshape(-1, *value.shape[2:])[shuffle_id]
         elif isinstance(value, dict):
             ret_dict[key] = process_nested_dict_for_train(value, shuffle_id)
+        elif value is not None and key not in ret_dict:
+            # Pass through non-tensor, non-dict values (e.g. VLM KV cache).
+            ret_dict[key] = value
     return ret_dict
 
 

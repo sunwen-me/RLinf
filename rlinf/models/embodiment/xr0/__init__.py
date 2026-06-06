@@ -105,10 +105,13 @@ def get_model(
         from transformers import AutoModel
 
         logger.info("Loading XR0 model from %s", model_path)
+        # Use torch_dtype (not dtype) to avoid JSON serialization issues
+        # in transformers >=4.53 when repr(config) is called during loading.
+        _dtype = torch_dtype or torch.bfloat16
         xr0_model = AutoModel.from_pretrained(
             model_path,
             trust_remote_code=True,
-            dtype=torch_dtype or torch.bfloat16,
+            torch_dtype=_dtype,
         )
 
     # Load action normalization stats (optional)

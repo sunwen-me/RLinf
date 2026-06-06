@@ -274,6 +274,13 @@ def compute_ppo_actor_loss(
     clip_fraction = (clip_mask * loss_mask).sum() / float(loss_mask_count)
     approx_kl = -torch.sum(approx_kl) / float(loss_mask_count)
 
+    # Non-negative KL approximation: E[exp(log_ratio) - 1 - log_ratio]
+    # This is always >= 0 and better represents the true KL divergence.
+    _masked_log_ratio = torch.where(loss_mask, log_ratio.detach(), torch.zeros_like(log_ratio))
+    approx_kl_nonneg = (
+        torch.exp(_masked_log_ratio) - 1.0 - _masked_log_ratio
+    ).sum() / float(loss_mask_count)
+
     dual_cliped_ratio = torch.where(dual_clip_mask, ratio, 0)
 
     if critic_warmup:
@@ -304,6 +311,10 @@ def compute_ppo_actor_loss(
             dual_cliped_ratio_for_metrics, loss_mask_for_metrics
         ),
         "actor/approx_kl": approx_kl.detach(),
+        "actor/approx_kl_nonneg": approx_kl_nonneg.detach(),
+        "actor/log_ratio_mean": _masked_log_ratio.mean().detach(),
+        "actor/log_ratio_abs_mean": _masked_log_ratio.abs().mean().detach(),
+        "actor/log_ratio_abs_max": _masked_log_ratio.abs().max().detach(),
         "actor/clip_fraction": clip_fraction.detach(),
     }
     return policy_loss, metrics_data

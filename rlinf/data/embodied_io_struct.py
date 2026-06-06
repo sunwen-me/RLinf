@@ -324,6 +324,26 @@ class RolloutResult:
             merged_forward_inputs = {}
         else:
             merged_forward_inputs = cat_list_of_dict_tensor(forward_inputs_list)
+            # Special handling for VLM KV cache: concatenate each layer's
+            # key/value tensors along the batch dimension instead of flattening.
+            if "vlm_past_key_values" in merged_forward_inputs:
+                kv_list_per_result = [
+                    fi["vlm_past_key_values"]
+                    for fi in forward_inputs_list
+                    if "vlm_past_key_values" in fi
+                ]
+                if kv_list_per_result:
+                    num_layers = len(kv_list_per_result[0])
+                    merged_kv = []
+                    for layer_idx in range(num_layers):
+                        keys = torch.cat(
+                            [kv[layer_idx][0] for kv in kv_list_per_result], dim=0
+                        )
+                        vals = torch.cat(
+                            [kv[layer_idx][1] for kv in kv_list_per_result], dim=0
+                        )
+                        merged_kv.append((keys, vals))
+                    merged_forward_inputs["vlm_past_key_values"] = merged_kv
         return RolloutResult(
             actions=merged_actions,
             prev_logprobs=merged_prev_logprobs,
@@ -794,13 +814,19 @@ def convert_trajectories_to_batch(
             all_keys.update(traj.forward_inputs.keys())
         batch["forward_inputs"] = {}
         for key in all_keys:
-            tensors = [
+            values = [
                 traj.forward_inputs[key]
                 for traj in trajectories
                 if key in traj.forward_inputs
             ]
-            if tensors:
-                batch["forward_inputs"][key] = torch.cat(tensors, dim=1)
+            if not values:
+                continue
+            if isinstance(values[0], torch.Tensor):
+                batch["forward_inputs"][key] = torch.cat(values, dim=1)
+            else:
+                # Non-tensor values (e.g. VLM KV cache): take the first one.
+                # These are per-sample and should not be concatenated.
+                batch["forward_inputs"][key] = values[0]
 
     # -------- tensor fields --------
     reference_trajectory = trajectories[0]

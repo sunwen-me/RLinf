@@ -93,7 +93,8 @@ def split_dict_to_chunk(data: dict, split_size, dim=0):
         elif isinstance(value, dict):
             split_vs = split_dict_to_chunk(value, split_size, dim)
         else:
-            raise ValueError(f"{key=}, {type(value)} is not supported.")
+            # Non-tensor, non-dict values (e.g. VLM KV cache): replicate to all chunks.
+            split_vs = [value for _ in range(split_size)]
         for split_id in range(split_size):
             splited_list[split_id][key] = (
                 split_vs[split_id].contiguous()
@@ -149,6 +150,9 @@ def stack_list_of_dict_tensor(list_of_dict: list, dim=0):
             ret[key] = stack_list_of_dict_tensor(v_list)
         elif _v0 is None:
             pass
+        elif isinstance(_v0, list):
+            # Non-tensor list values (e.g. VLM KV cache): take the first one.
+            ret[key] = _v0
         else:
             raise ValueError(f"{key=}, {type(_v0)} is not supported!")
     return ret
@@ -172,8 +176,19 @@ def cat_list_of_dict_tensor(list_of_dict: list, dim=0):
         elif isinstance(_v0, np.ndarray):
             ret[key] = np.concatenate([v for v in v_list if v is not None], axis=dim)
         elif isinstance(_v0, list):
-            assert dim == 0, f"{key=} is list, dim !=0 is not supported!"
-            ret[key] = [item for sub in v_list if sub is not None for item in sub]
+            # Special handling for VLM KV cache: list of (key, value) tuples.
+            # Concatenate each layer's key/value tensors along the batch dim.
+            if _v0 and isinstance(_v0[0], tuple) and len(_v0[0]) == 2 and isinstance(_v0[0][0], torch.Tensor):
+                num_layers = len(_v0)
+                merged = []
+                for layer_idx in range(num_layers):
+                    keys = torch.cat([kv[layer_idx][0] for kv in v_list if kv is not None], dim=dim)
+                    vals = torch.cat([kv[layer_idx][1] for kv in v_list if kv is not None], dim=dim)
+                    merged.append((keys, vals))
+                ret[key] = merged
+            else:
+                assert dim == 0, f"{key=} is list, dim !=0 is not supported!"
+                ret[key] = [item for sub in v_list if sub is not None for item in sub]
         elif isinstance(_v0, dict):
             ret[key] = cat_list_of_dict_tensor(v_list, dim=dim)
         else:
@@ -210,14 +225,20 @@ def split_dict(
             for i in range(count):
                 splitted_batches[i][key] = splitted_values[i].contiguous()
         elif isinstance(value, list):
-            length = len(value)
-            assert length == total_size, (
-                f"List field '{key}' expected length {total_size}, got {length}."
-            )
-            begin = 0
-            for i, size in enumerate(split_sizes):
-                splitted_batches[i][key] = value[begin : begin + size]
-                begin += size
+            # Special case: VLM KV cache (list of (key, value) tuples).
+            # Replicate to all sub-batches instead of splitting.
+            if value and isinstance(value[0], tuple) and len(value[0]) == 2 and isinstance(value[0][0], torch.Tensor):
+                for i in range(count):
+                    splitted_batches[i][key] = value
+            else:
+                length = len(value)
+                assert length == total_size, (
+                    f"List field '{key}' expected length {total_size}, got {length}."
+                )
+                begin = 0
+                for i, size in enumerate(split_sizes):
+                    splitted_batches[i][key] = value[begin : begin + size]
+                    begin += size
         elif isinstance(value, dict):
             splitted_sub_batches = split_dict(value, split_sizes)
             for i in range(count):
