@@ -97,6 +97,7 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         action_env_dim: Optional[int] = None,
         action_mapper: Optional[ActionMapper] = None,
         train_expert_only: bool = False,
+        robot_type: str = "libero_all",
     ):
         super().__init__()
         self.logger = get_logger()
@@ -109,6 +110,9 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         self.model_path = model_path
         self.add_value_head = add_value_head
         self.noise_method = noise_method
+        # Must match Xiaomi server input_data["task_id"].
+        # Used by processor.get_action_mask(...) and processor.decode_action(...).
+        self.robot_type = robot_type
 
         # Action mapper: handles 32D <-> env_dim conversion with valid_action_mask.
         # Takes precedence over action_env_dim (simple slicing).
@@ -137,6 +141,11 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
 
         # Qwen3-VL processor (lazy-loaded on first use)
         self._processor = None
+
+        # Action mask from processor: (1, num_action_chunks, action_dim)
+        # Loaded lazily on first use via _get_action_mask().
+        self._action_mask: torch.Tensor | None = None
+        self._action_mask_robot_type: str | None = None
 
         # Cached VLM KV from the most recent sample_actions call.
         # Only used as fallback when forward_inputs doesn't have packed KV,
@@ -268,10 +277,54 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             source = self.model_path if self.model_path else "Qwen/Qwen3-VL-4B-Instruct"
             self.logger.info("Loading processor from %s", source)
             self._processor = AutoProcessor.from_pretrained(
-                source, trust_remote_code=True
+                source, trust_remote_code=True, use_fast=False
             )
             self._processor.tokenizer.padding_side = "right"
         return self._processor
+
+    def _get_action_mask(
+        self,
+        device: torch.device,
+        robot_type: Optional[str] = None,
+    ) -> torch.Tensor:
+        """Load action_mask from processor and cache it per robot_type.
+
+        Xiaomi server uses ``input_data["task_id"]`` for both
+        ``processor.get_action_mask(robot_type)`` and
+        ``processor.decode_action(..., robot_type=robot_type)``.
+        Using a hard-coded LIBERO mask for SO101/ManiSkill will decode
+        actions with the wrong statistics and can produce huge actions.
+        """
+        requested_robot_type = robot_type or self.robot_type
+
+        if (
+            self._action_mask is None
+            or self._action_mask_robot_type != requested_robot_type
+        ):
+            proc = self.processor
+            if hasattr(proc, "get_action_mask"):
+                available = list(proc.list_robot_types()) if hasattr(proc, "list_robot_types") else []
+                if available and requested_robot_type not in available:
+                    self.logger.warning(
+                        "Requested robot_type=%s is not in processor.list_robot_types()=%s; "
+                        "calling get_action_mask anyway.",
+                        requested_robot_type, available,
+                    )
+                mask = proc.get_action_mask(requested_robot_type)
+                self.logger.info(
+                    "Loaded action_mask from processor: robot_type=%s, shape=%s",
+                    requested_robot_type, tuple(mask.shape),
+                )
+            else:
+                mask = torch.ones(
+                    1, self.num_action_chunks, self.action_dim, dtype=torch.float32
+                )
+                self.logger.warning(
+                    "Processor has no get_action_mask; using all-ones mask"
+                )
+            self._action_mask = mask
+            self._action_mask_robot_type = requested_robot_type
+        return self._action_mask.to(device=device, dtype=torch.bfloat16)
 
     @property
     def _no_split_modules(self) -> list[str]:
@@ -488,9 +541,10 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         x1_pred = x_t + v_t * (1 - t_input)
 
         if mode == "eval":
-            x0_weight = 1 - (t_input - delta_input)
-            x1_weight = t_input - delta_input
+            # Euler step: x_{t+1} = x_t + v * delta (matches checkpoint forward)
+            x_t_mean = x_t + v_t * delta_input
             x_t_std = torch.zeros_like(x_t)
+            return x_t_mean, x_t_std
         elif mode == "train":
             if self.noise_method == "flow_sde":
                 t_safe = torch.where(
@@ -502,20 +556,18 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
                 sigmas = sigmas[:-1]
                 sigma_i = sigmas[idx].view(1, 1, 1).expand_as(x_t).to(dtype=orig_dtype)
 
-                x0_weight = 1 - (t_input - delta_input)
-                x1_weight = t_input - delta_input - (
+                # Euler step + Flow-SDE drift correction
+                x_t_mean = x_t + v_t * delta_input - (
                     sigma_i**2 * delta_input / (2 * t_input)
-                )
+                ) * v_t
                 x_t_std = torch.sqrt(delta_input) * sigma_i
             else:
                 sigma = self.noise_level * math.sqrt(delta)
-                x0_weight = 1 - (t_input - delta_input)
-                x1_weight = t_input - delta_input
+                x_t_mean = x_t + v_t * delta_input
                 x_t_std = torch.full_like(x_t, sigma)
         else:
             raise ValueError(f"Unknown mode: {mode}")
 
-        x_t_mean = x0_pred * x0_weight + x1_pred * x1_weight
         return x_t_mean, x_t_std
 
     def _compute_denoise_step(
@@ -558,6 +610,8 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         state_tensor: torch.Tensor,
         device: torch.device,
         mode: Literal["train", "eval"] = "train",
+        robot_type: Optional[str] = None,
+        seed: Optional[int] = None,
     ) -> dict[str, Any]:
         """Run rectified flow denoising step-by-step and record the chain.
 
@@ -593,8 +647,11 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         # VLM forward to get KV-cache and hidden states.
         # Temporarily disable gradient checkpointing on ALL VLM sub-modules
         # so the @check_model_inputs decorator does not force use_cache=False.
+        vlm_keys = {"input_ids", "attention_mask", "pixel_values", "image_grid_thw"}
         vlm_inputs = {
-            k: v.to(device) for k, v in vlm_batch.items() if isinstance(v, torch.Tensor)
+            k: v.to(device)
+            for k, v in vlm_batch.items()
+            if k in vlm_keys and isinstance(v, torch.Tensor)
         }
 
         vlm_module = self.xr0_model.vlm
@@ -611,80 +668,50 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             for module, state in gc_states:
                 module.gradient_checkpointing = state
         past_key_values = list(vlm_outputs.past_key_values)
-        vlm_pos_max = vlm_outputs.position_ids.max(dim=-1)[0]
 
         # Pack KV cache into flat tensors for forward_inputs transport.
         packed_kv = self._pack_vlm_kv(past_key_values)
+        vlm_pos_max = vlm_outputs.position_ids.max(dim=-1)[0]
         packed_pos_max = self._pack_vlm_pos_max(vlm_pos_max, batch_size)
 
         # Capture VLM hidden states for value computation
-        # Qwen3VLCausalLMOutputWithPast has hidden_states (tuple) not last_hidden_state
         if hasattr(vlm_outputs, "hidden_states") and vlm_outputs.hidden_states is not None:
-            vlm_hidden_states = vlm_outputs.hidden_states[-1]  # Last layer hidden states
+            vlm_hidden_states = vlm_outputs.hidden_states[-1]
         else:
-            # Fallback: use logits as proxy (should not happen with output_hidden_states=True)
             vlm_hidden_states = vlm_outputs.logits
         vlm_attention_mask = vlm_inputs.get(
             "attention_mask",
             torch.ones(batch_size, vlm_hidden_states.shape[1], device=device, dtype=torch.long),
         )
 
-        # Position ids for DiT (continue from VLM's last position)
-        action_len = self.num_action_chunks
-        state_len = state_tensor.shape[1]  # typically 1
-        q_len = action_len + state_len + 1  # +1 for sink token
+        # --- Match checkpoint forward: position_embeds + attn_mask ---
+        # Action mask from processor (determines action_len).
+        action_mask_base = self._get_action_mask(device, robot_type=robot_type)
+        action_len = action_mask_base.shape[1]
+        action_mask = action_mask_base.expand(batch_size, -1, -1)
+
+        # Pad state to model's expected dim.
+        state_tensor_padded = self._pad_state(state_tensor)
+        _, state_len, _ = state_tensor_padded.shape
+        dit_query_length = action_len + state_len + 1
+
+        # Position ids (same as checkpoint forward line 1827-1831)
         position_ids = (
-            torch.arange(0, q_len, device=device)
-            .view(1, 1, -1)
-            .repeat(3, batch_size, 1)
+            torch.arange(0, dit_query_length, device=device).view(1, 1, -1).repeat(3, batch_size, 1)
             + vlm_outputs.position_ids.max(dim=-1)[0][..., None]
             + 1
         )
+        # Position embeds (same as checkpoint forward line 1832)
+        position_embeds = self.xr0_model.rotary_emb(action_mask, position_ids)
 
-        # Attention mask
-        cache_mask = vlm_inputs.get(
-            "attention_mask",
-            torch.ones(batch_size, 1, device=device, dtype=torch.long),
-        )
-        cache_mask = cache_mask[:, None, :].expand(-1, q_len, -1)
+        # Attention mask (same as checkpoint forward line 1835-1838)
+        dit_mask = torch.tril(torch.ones((batch_size, dit_query_length, dit_query_length), device=device), diagonal=0)
+        cache_mask = vlm_outputs.attention_mask[:, None, :].expand(-1, dit_query_length, -1)
+        attn_mask = torch.cat([cache_mask, dit_mask], dim=-1)[:, None].bool()
 
-        # Build causal mask for DiT tokens
-        s_len = state_len + 1
-        a_len = action_len
-        mask_ss = torch.tril(torch.ones(s_len, s_len, device=device))
-        mask_sa = torch.zeros(s_len, a_len, device=device)
-        mask_as = torch.ones(a_len, s_len, device=device)
-        mask_aa = torch.tril(torch.ones(a_len, a_len, device=device))
-        local_window = getattr(self.xr0_model, "local_window", 4)
-        mask_aa = mask_aa * torch.triu(
-            torch.ones(a_len, a_len, device=device), diagonal=-local_window
-        )
-        causal_mask = torch.cat(
-            [torch.cat([mask_ss, mask_sa], dim=1),
-             torch.cat([mask_as, mask_aa], dim=1)],
-            dim=0,
-        )
-        attn_mask = torch.cat(
-            [cache_mask, causal_mask[None].expand(batch_size, -1, -1)], dim=-1
-        )[:, None].bool()
-
-        # State embedding (pad/truncate to match model's expected dim)
-        state_tensor_padded = self._pad_state(state_tensor)
+        # State embedding
         state_embed = self.xr0_model.state_projector(
             state_tensor_padded.to(device=device, dtype=torch.bfloat16)
-        )
-
-        # Position embeddings (RoPE)
-        dummy_action = torch.zeros(
-            (batch_size, action_len, self.action_dim),
-            device=device, dtype=torch.bfloat16,
-        )
-        position_embeds = self.xr0_model.rotary_emb(dummy_action, position_ids)
-
-        # Action mask (all ones)
-        action_mask = torch.ones(
-            (batch_size, action_len, self.action_dim),
-            device=device, dtype=torch.bfloat16,
         )
 
         # Timestep schedule: [1.0, 0.8, 0.6, 0.4, 0.2, 0.0] for 5 steps
@@ -708,11 +735,20 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         else:
             denoise_ind = -1  # all deterministic
 
-        # Denoising loop
+        # Denoising loop — match Xiaomi server: seed controls initial noise.
+        # server.py line 1857: torch.manual_seed(kwargs["seed"])
+        if seed is not None:
+            cpu_rng_state = torch.get_rng_state()
+            gpu_rng_state = torch.cuda.get_rng_state(device) if device.type == "cuda" else None
+            torch.manual_seed(seed)
         x_t = torch.randn(
             (batch_size, action_len, self.action_dim),
             device=device, dtype=torch.bfloat16,
         )
+        if seed is not None:
+            torch.set_rng_state(cpu_rng_state)
+            if gpu_rng_state is not None:
+                torch.cuda.set_rng_state(gpu_rng_state, device)
         chains = [x_t.detach().clone()]
         log_probs = []
         # Debug: store v_t / mean / std at the chosen denoise step.
@@ -722,6 +758,11 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
 
         for idx in range(self.num_steps):
             t_val = timesteps[idx]
+            if idx == 0:
+                self.logger.info("[DENOISE_DBG] step0 x_t[0,0,:5]=%s attn_mask=%s pos_embeds=%s",
+                    x_t[0,0,:5].float().tolist(),
+                    tuple(attn_mask.shape),
+                    tuple(position_embeds[0].shape))
 
             # DiT forward: predict velocity
             t_tensor = t_val.view(1, 1, 1).expand(
@@ -731,6 +772,9 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
                 x_t, t_tensor, action_mask, state_embed,
                 position_embeds, past_key_values, attn_mask,
             )
+            if idx == 0:
+                self.logger.info("[DENOISE_DBG] step0 v_t[0,0,:7]=%s max_abs=%.4f",
+                    v_t[0,0,:7].float().tolist(), v_t.float().abs().max().item())
 
             # Compute denoising step with Flow-SDE
             step_mode = mode if idx == denoise_ind or mode == "eval" else "eval"
@@ -848,6 +892,65 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
     # Rollout-time: predict_action_batch
     # ------------------------------------------------------------------
 
+    def _checkpoint_forward_eval(self, state, action_mask, vlm_inputs, seed):
+        """Replicate checkpoint forward for eval mode.
+
+        Same logic as modeling_mibot.py:forward but without modifying the
+        checkpoint file.  Handles seed internally so it's not forwarded
+        to the VLM.
+        """
+        model = self.xr0_model
+
+        # VLM forward
+        vlm_outputs = model.vlm(**vlm_inputs, use_cache=True)
+        past_key_values = list(vlm_outputs.past_key_values)
+
+        action_bs, action_length, _ = action_mask.shape
+        _, state_length, _ = state.shape
+        dit_query_length = action_length + state_length + 1
+
+        # Position embeds (matches checkpoint line 1827-1832)
+        position_ids = (
+            torch.arange(0, dit_query_length, device=action_mask.device)
+            .view(1, 1, -1).repeat(3, action_bs, 1)
+            + vlm_outputs.position_ids.max(dim=-1)[0][..., None]
+            + 1
+        )
+        position_embeds = model.rotary_emb(action_mask, position_ids)
+
+        # Attention mask (matches checkpoint line 1835-1838)
+        dit_mask = torch.tril(
+            torch.ones((action_bs, dit_query_length, dit_query_length), device=action_mask.device), diagonal=0
+        )
+        cache_mask = vlm_outputs.attention_mask[:, None, :].expand(-1, dit_query_length, -1)
+        attn_mask = torch.cat([cache_mask, dit_mask], dim=-1)[:, None].bool()
+
+        # State embedding
+        state_embed = model.state_projector(state)
+
+        # Denoising loop with seed
+        cpu_rng = torch.get_rng_state()
+        gpu_rng = torch.cuda.get_rng_state(action_mask.device) if action_mask.is_cuda else None
+        torch.manual_seed(seed)
+        x = torch.randn_like(action_mask)
+        torch.set_rng_state(cpu_rng)
+        if gpu_rng is not None:
+            torch.cuda.set_rng_state(gpu_rng, action_mask.device)
+
+        num_steps = 5
+        dt = 1.0 / num_steps
+        for step in range(num_steps):
+            t = torch.ones((x.shape[0], 1, 1), device=x.device, dtype=x.dtype) * step / num_steps
+            v = model.dit_forward(x, t, action_mask, state_embed, position_embeds, past_key_values, attn_mask)
+            x = x + v * dt
+
+        # Match ActionGenerationOutput interface
+        class _Out:
+            pass
+        out = _Out()
+        out.actions = x
+        return out
+
     @torch.no_grad()
     def predict_action_batch(
         self,
@@ -866,9 +969,12 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         device = next(self.parameters()).device
 
         images = env_obs["main_images"]
+        wrist_images = env_obs.get("wrist_images")  # optional
         states = env_obs["states"]
         task_descriptions = env_obs.get("task_descriptions") or [""] * len(images)
         batch_size = len(images)
+        # Match Xiaomi server: robot_type comes from input_data["task_id"].
+        robot_type = env_obs.get("task_id") or env_obs.get("robot_type") or self.robot_type
 
         # State tensor: (B, 1, STATE_DIM)
         state_tensor = torch.from_numpy(np.asarray(states, dtype=np.float32))
@@ -877,24 +983,70 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         if state_tensor.ndim == 2:
             state_tensor = state_tensor.unsqueeze(1)
 
-        # Build VLM batch
+        # Build VLM batch (with wrist images if available, matching Xiaomi server)
         vlm_batch = self._build_vlm_batch(
-            images, task_descriptions, state_tensor, device
+            images, task_descriptions, state_tensor, device,
+            wrist_images=wrist_images,
         )
 
-        # Run step-by-step denoising with chain recording
-        outputs = self.sample_actions(vlm_batch, state_tensor, device, mode=mode)
+        # Denormalize actions using official processor.decode_action
+        proc = self.processor
+        action_mask = self._get_action_mask(device, robot_type=robot_type)
 
-        # Denormalize actions
-        actions_np = outputs["actions"].float().cpu().numpy()
-        if self.action_mean is not None and self.action_std is not None:
-            mean = self.action_mean.cpu().numpy()
-            std = self.action_std.cpu().numpy()
-            actions_np = denormalize_action(actions_np, mean, std)
+        if mode == "eval":
+            # Eval: replicate checkpoint forward logic without modifying the
+            # checkpoint file.  Calls VLM, builds position_embeds/attn_mask
+            # exactly like modeling_mibot.py:forward, then runs the denoising
+            # loop with Euler steps.
+            st = self._pad_state(state_tensor).to(device=device, dtype=torch.bfloat16)
+            rollout_seed = int(torch.randint(0, 2**31, (1,)).item())
+            vlm_inputs = {k: v.to(device) for k, v in vlm_batch.items() if isinstance(v, torch.Tensor)}
+            out = self._checkpoint_forward_eval(st, action_mask, vlm_inputs, rollout_seed)
+            raw_actions_cpu = out.actions.float().cpu()
+            actions_np = proc.decode_action(raw_actions_cpu, robot_type=robot_type).numpy()
+            env_actions_np = actions_np[:, :self.num_action_chunks, : self.action_env_dim]
+            result = {
+                "prev_logprobs": torch.zeros(batch_size, self.num_action_chunks, self.action_dim),
+                "prev_values": torch.zeros(batch_size),
+                "forward_inputs": {},
+            }
+            return env_actions_np, result
 
-        actions_np = actions_np[:, : self.num_action_chunks, :]
+        # Train: step-by-step denoising with chain recording.
+        rollout_seed = int(torch.randint(0, 2**31, (1,)).item())
+        outputs = self.sample_actions(
+            vlm_batch, state_tensor, device, mode=mode,
+            robot_type=robot_type, seed=rollout_seed,
+        )
+
+        raw_actions_cpu = outputs["actions"].float().cpu()
+        decoded = proc.decode_action(raw_actions_cpu, robot_type=robot_type)
+        actions_np = decoded.numpy()[:, :self.num_action_chunks, :]
+
+        # ---- Step 2 diagnostic: print raw and decoded action chunk ----
+        chunk_raw = raw_actions_cpu[0, :self.num_action_chunks, :7].numpy()
+        chunk_7d = actions_np[0, :self.num_action_chunks, :7]
+        self.logger.info(
+            "[XR0_RAW] max_abs=%.4f first=%s",
+            np.max(np.abs(chunk_raw)),
+            np.array2string(chunk_raw[0], precision=4, suppress_small=True),
+        )
+        self.logger.info(
+            "[XR0_DECODED] max_abs=%.4f first=%s",
+            np.max(np.abs(chunk_7d)),
+            np.array2string(chunk_7d[0], precision=4, suppress_small=True),
+        )
+        if chunk_7d.shape[0] > 1:
+            step_diff = np.abs(chunk_7d[1:] - chunk_7d[:-1])
+            self.logger.info(
+                "[XR0_STEP_DIFF] max=%s",
+                np.array2string(np.max(step_diff, axis=0), precision=4, suppress_small=True),
+            )
 
         # Build forward_inputs for training replay
+        # NOTE: robot_type is NOT stored here because forward_inputs must
+        # only contain tensors (cat_list_of_dict_tensor will crash on strings).
+        # robot_type is retrieved from env_obs or self.robot_type in default_forward.
         forward_inputs: dict[str, Any] = {
             "chains": outputs["chains"].cpu(),
             "denoise_inds": outputs["denoise_inds"].cpu(),
@@ -922,6 +1074,7 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         for k in ("debug_v_t", "debug_x_t_mean", "debug_x_t_std"):
             if k in outputs:
                 forward_inputs[k] = outputs[k]
+
         # Slice/gather actions to environment's expected dimension.
         # XR0 outputs 32D (bimanual) but e.g. LIBERO expects 7D (right arm),
         # SO101 expects 12D (5 joints + gripper per arm).
@@ -971,6 +1124,9 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             forward_inputs = {}
 
         device = next(self.parameters()).device
+        # robot_type is no longer stored in forward_inputs (it's a string,
+        # not a tensor, and would crash cat_list_of_dict_tensor).
+        robot_type = self.robot_type
 
         chains = forward_inputs.get("chains")  # (B, num_steps+1, C, D)
         denoise_inds = forward_inputs.get("denoise_inds")  # (B,)
@@ -1101,11 +1257,8 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         mask_ss = torch.tril(torch.ones(s_len, s_len, device=device))
         mask_sa = torch.zeros(s_len, a_len, device=device)
         mask_as = torch.ones(a_len, s_len, device=device)
+        # Full causal mask: matches checkpoint training mask (modeling_mibot.py:1832).
         mask_aa = torch.tril(torch.ones(a_len, a_len, device=device))
-        local_window = getattr(self.xr0_model, "local_window", 4)
-        mask_aa = mask_aa * torch.triu(
-            torch.ones(a_len, a_len, device=device), diagonal=-local_window
-        )
         causal_mask = torch.cat(
             [torch.cat([mask_ss, mask_sa], dim=1),
              torch.cat([mask_as, mask_aa], dim=1)],
@@ -1127,10 +1280,10 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         )
         position_embeds = self.xr0_model.rotary_emb(dummy_action, position_ids)
 
-        action_mask = torch.ones(
-            (batch_size, action_len, self.action_dim),
-            device=device, dtype=torch.bfloat16,
-        )
+        # Action mask from processor (same as sample_actions)
+        action_mask_base = self._get_action_mask(device, robot_type=robot_type)
+        action_len = action_mask_base.shape[1]
+        action_mask = action_mask_base.expand(batch_size, -1, -1)
 
         timesteps = torch.linspace(
             1.0, 0.0, self.num_steps + 1, device=device
@@ -1244,59 +1397,68 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         task_descriptions: list[str],
         state_tensor: torch.Tensor,
         device: torch.device,
+        wrist_images: Union[np.ndarray, torch.Tensor, None] = None,
     ) -> dict[str, torch.Tensor]:
-        """Convert env observations to Qwen3-VL processor format."""
-        pil_images = []
-        for img in images:
-            # Handle both Tensor and numpy array inputs
+        """Convert env observations to Qwen3-VL processor format.
+
+        This intentionally mirrors Xiaomi official ``server.py`` instead of
+        using ``apply_chat_template``.  The assistant prefix is the empty COT
+        block used by XR0:
+
+            <|im_start|>assistant
+            <|cot|><|/cot|><|im_end|>
+
+        ``/no_cot`` is a user-side suffix, not text for the assistant to
+        generate.
+        """
+        def _to_pil(img):
             if isinstance(img, torch.Tensor):
                 img_np = img.detach().cpu().numpy()
             else:
                 img_np = img
-            pil_img = Image.fromarray(img_np.astype(np.uint8))
-            pil_img = resize_image(pil_img, factor=32, max_pixels=90000)
-            pil_images.append(pil_img)
+            return Image.fromarray(img_np.astype(np.uint8)).convert("RGB")
 
-        messages = []
-        for i, pil_img in enumerate(pil_images):
-            instruction = task_descriptions[i] if i < len(task_descriptions) else ""
-            messages.append(
-                [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": "\n# Ego View\n"},
-                            {"type": "image", "image": pil_img},
-                            {
-                                "type": "text",
-                                "text": (
-                                    "\nGenerate robot actions"
-                                    " for the task:\n"
-                                    + instruction
-                                ),
-                            },
-                        ],
-                    },
-                    {
-                        "role": "assistant",
-                        "content": [{"type": "text", "text": "<bot></bot>"}],
-                    },
-                ]
+        if wrist_images is None or len(wrist_images) == 0:
+            raise ValueError(
+                "XR0 Xiaomi non-bridge/fractal prompt requires wrist_images "
+                "because the official prompt contains both Base View and "
+                "Left-Wrist View image pads."
             )
 
-        inputs = self.processor.apply_chat_template(
-            messages,
-            tokenize=True,
-            return_dict=True,
-            return_tensors="pt",
+        texts: list[str] = []
+        processor_images = []
+
+        for i in range(len(images)):
+            lang = task_descriptions[i] if i < len(task_descriptions) else ""
+            instruction = (
+                "<|im_start|>user\n"
+                "The following observations are captured from multiple views.\n"
+                "# Base View\n"
+                "<|vision_start|><|image_pad|><|vision_end|>\n"
+                "# Left-Wrist View\n"
+                "<|vision_start|><|image_pad|><|vision_end|>\n"
+                "Generate robot actions for the task:\n"
+                + lang.rstrip(".")
+                + " /no_cot"
+            )
+            texts.append(instruction)
+
+            # Flat image order must match the image_pad order in every text:
+            # base_i first, then wrist_left_i.
+            processor_images.append(_to_pil(images[i]))
+            processor_images.append(_to_pil(wrist_images[i]))
+
+        inputs = self.processor(
+            text=texts,
+            images=processor_images,
+            videos=None,
             padding=True,
-            images_kwargs={"do_resize": False},
+            return_tensors="pt",
         )
 
         batch = {
             k: v.to(device) for k, v in inputs.items() if isinstance(v, torch.Tensor)
         }
-        batch["state"] = state_tensor.to(device=device, dtype=torch.bfloat16)
         return batch
 
     # ------------------------------------------------------------------
