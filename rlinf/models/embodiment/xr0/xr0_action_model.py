@@ -674,15 +674,33 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         vlm_pos_max = vlm_outputs.position_ids.max(dim=-1)[0]
         packed_pos_max = self._pack_vlm_pos_max(vlm_pos_max, batch_size)
 
-        # Capture VLM hidden states for value computation
+        # Capture VLM hidden states for value computation.
+        # Qwen3VLCausalLMOutputWithPast stores hidden_states as a tuple
+        # (one per layer when output_hidden_states=True). The last element
+        # is the final layer's hidden states with shape (B, seq_len, hidden_dim).
         if hasattr(vlm_outputs, "hidden_states") and vlm_outputs.hidden_states is not None:
-            vlm_hidden_states = vlm_outputs.hidden_states[-1]
+            if isinstance(vlm_outputs.hidden_states, tuple):
+                vlm_hidden_states = vlm_outputs.hidden_states[-1]
+            else:
+                vlm_hidden_states = vlm_outputs.hidden_states
         else:
-            vlm_hidden_states = vlm_outputs.logits
-        vlm_attention_mask = vlm_inputs.get(
-            "attention_mask",
-            torch.ones(batch_size, vlm_hidden_states.shape[1], device=device, dtype=torch.long),
-        )
+            # Fallback: run a separate VLM forward with output_hidden_states=True
+            vlm_outputs2 = self.xr0_model.vlm(**vlm_inputs, use_cache=False, output_hidden_states=True)
+            if hasattr(vlm_outputs2, "hidden_states") and vlm_outputs2.hidden_states is not None:
+                vlm_hidden_states = vlm_outputs2.hidden_states[-1] if isinstance(vlm_outputs2.hidden_states, tuple) else vlm_outputs2.hidden_states
+            else:
+                vlm_hidden_states = None
+
+        if vlm_hidden_states is not None:
+            vlm_attention_mask = vlm_inputs.get(
+                "attention_mask",
+                torch.ones(batch_size, vlm_hidden_states.shape[1], device=device, dtype=torch.long),
+            )
+        else:
+            vlm_attention_mask = vlm_inputs.get(
+                "attention_mask",
+                torch.ones(batch_size, 1, device=device, dtype=torch.long),
+            )
 
         # --- Match checkpoint forward: position_embeds + attn_mask ---
         # Action mask from processor (determines action_len).
@@ -817,7 +835,7 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             prev_logprobs = self.action_mapper.apply_mask(prev_logprobs)
 
         # Compute value from VLM hidden states
-        if self.add_value_head:
+        if self.add_value_head and vlm_hidden_states is not None:
             prev_values = self.get_value_from_vlm(
                 vlm_hidden_states.detach(), vlm_attention_mask.detach()
             )
@@ -833,10 +851,11 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             "prev_logprobs": prev_logprobs,
             "prev_values": prev_values,
             "denoise_inds": torch.full((batch_size,), denoise_ind, dtype=torch.long),
-            "vlm_hidden_states": vlm_hidden_states.detach(),
-            "vlm_attention_mask": vlm_attention_mask.detach(),
-            "vlm_pos_max": packed_pos_max,
         }
+        if vlm_hidden_states is not None:
+            result["vlm_hidden_states"] = vlm_hidden_states.detach()
+            result["vlm_attention_mask"] = vlm_attention_mask.detach()
+        result["vlm_pos_max"] = packed_pos_max
         result.update(packed_kv)
         # Debug tensors for replay comparison.
         if debug_v_t is not None:
@@ -1086,9 +1105,15 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         else:
             env_actions_np = actions_np[:, :, : self.action_env_dim]
 
+        # prev_values shape: (B, 1) — single value per chunk for PPO/GAE.
+        # The value head produces (B,), expand to (B, 1).
+        prev_values = outputs["prev_values"].cpu()
+        if prev_values.ndim == 1:
+            prev_values = prev_values.unsqueeze(1)
+
         result = {
             "prev_logprobs": outputs["prev_logprobs"].cpu(),
-            "prev_values": outputs["prev_values"].cpu(),
+            "prev_values": prev_values,
             "forward_inputs": forward_inputs,
         }
         return env_actions_np, result
