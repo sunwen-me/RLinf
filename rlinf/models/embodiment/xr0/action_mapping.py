@@ -199,10 +199,11 @@ ACTION_MAPPING_PRESETS = {
         ],
         "description": "SO101 dual-arm: 5 arm joints + 1 gripper per arm = 12D",
     },
-    # LIBERO right-arm only: ee_pos:3 + ee_aa:3 + gripper:1 = 7D
-    "libero_right_arm": {
-        "env_action_indices": [14, 15, 16, 17, 18, 19, 20],
-        "description": "LIBERO: right arm ee_pos + ee_aa + gripper = 7D",
+    # LIBERO left-arm only: ee_pos:3 + ee_aa:3 + gripper:1 = 7D
+    # Matches Xiaomi official eval: action_chunk[:, 0:7] = left arm
+    "libero_left_arm": {
+        "env_action_indices": [0, 1, 2, 3, 4, 5, 6],
+        "description": "LIBERO: left arm ee_pos + ee_aa + gripper = 7D",
     },
     # Full 32D (no masking, for debugging)
     "identity": {
