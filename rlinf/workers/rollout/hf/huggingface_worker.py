@@ -263,6 +263,7 @@ class MultiStepRolloutWorker(Worker):
             SupportedModel.DREAMZERO,
             SupportedModel.CNN_POLICY,
             SupportedModel.CFG_MODEL,
+            SupportedModel.XR0,
         ]:
             if self.cfg.algorithm.loss_type == "embodied_dagger":
                 kwargs = {"mode": "eval"}
@@ -660,30 +661,39 @@ class MultiStepRolloutWorker(Worker):
                 and isinstance(grid_thw, torch.Tensor)
                 and isinstance(pixel_values, torch.Tensor)
             ):
+                # Determine images-per-env: grid_thw rows may exceed env
+                # count when each env uses multiple cameras (e.g. base+wrist).
+                num_grid_rows = grid_thw.shape[0]
+                total_envs = sum(sizes)
+                imgs_per_env = max(num_grid_rows // total_envs, 1)
+
                 self.log_info(
                     f"_split_rollout_result: pixel_values={pixel_values.shape}, "
-                    f"image_grid_thw={grid_thw.shape}, grid_thw_values={grid_thw}, sizes={sizes}"
+                    f"image_grid_thw={grid_thw.shape}, grid_thw_values={grid_thw}, "
+                    f"sizes={sizes}, imgs_per_env={imgs_per_env}"
                 )
-                patch_counts = grid_thw.prod(dim=-1).tolist()  # (B,)
+                patch_counts = grid_thw.prod(dim=-1).tolist()  # (num_images,)
                 acc = 0
                 cumsum = []
                 for c in patch_counts:
                     acc += c
                     cumsum.append(acc)
 
-                # Split pixel_values by per-image patch boundaries.
-                # Use .contiguous() since the VLM forward may require it.
+                # Scale sizes from env-level to image-level.
+                img_sizes = [sz * imgs_per_env for sz in sizes]
+
+                # Split pixel_values by per-env image groups.
                 pv_split = []
                 img_offset = 0
-                for sz in sizes:
-                    img_end = img_offset + sz
+                for img_sz in img_sizes:
+                    img_end = img_offset + img_sz
                     pv_start = cumsum[img_offset - 1] if img_offset > 0 else 0
                     pv_end = cumsum[img_end - 1]
                     pv_split.append(pixel_values[pv_start:pv_end].contiguous())
                     img_offset = img_end
 
-                # Split image_grid_thw by batch.
-                grid_split = list(torch.split(grid_thw, sizes, dim=0))
+                # Split image_grid_thw by env (each env has imgs_per_env rows).
+                grid_split = list(torch.split(grid_thw, img_sizes, dim=0))
 
             split_forward_inputs = [{} for _ in sizes]
             for key, value in fi.items():
