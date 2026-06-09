@@ -10,14 +10,19 @@ model_path: "dummy"
 precision: "bf16"
 
 # Action/chunk settings
+# NOTE: action_mask from processor has shape (1, 10, 32), so model outputs
+# 10 timesteps. Xiaomi eval uses replan_steps=10 matching this.
 action_dim: 32
-num_action_chunks: 30
+num_action_chunks: 10
 num_steps: 5
 
 # Environment action dimension: slice model output to this many dims
 # before returning to env.  XR0 outputs 32D (bimanual) but LIBERO
 # expects 7D (right arm: ee_pos:3 + ee_aa:3 + gripper:1).
 action_env_dim: 7
+
+# No action_mapping needed for LIBERO -- default slicing [:, :7] matches
+# the Xiaomi eval code (action_chunk[:, 0:7] = left arm ee_pos+aa+gripper).
 
 # LoRA settings (disabled by default)
 is_lora: False
@@ -34,13 +39,18 @@ add_value_head: False
 trust_remote_code: True
 low_cpu_mem_usage: True
 
-# Action normalization stats (optional; skip denormalization if null)
-# Should be a YAML file with "mean" and "std" keys, each shape (num_action_chunks, action_dim)
-stats_path: null
+# Action normalization stats: model outputs normalized actions, must denormalize.
+# Extracted from processor.action_config["libero_all"] mean/std.
+stats_path: "./models/Xiaomi-Robotics-0-LIBERO/action_stats.yaml"
 unnorm_key: null
 
 # Flow-matching noise level for RL training (higher = more exploration)
-noise_level: 0.5
+# 0.5 was too high (arm twitching); 0.05 gives mild exploration.
+noise_level: 0.05
+
+# Freeze VLM backbone, only train DiT + projectors (~270M out of 4.7B)
+# Prevents pretrained knowledge degradation during RL fine-tuning
+train_expert_only: True
 
 # XR0-specific config
 xr0:
