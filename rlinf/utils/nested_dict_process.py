@@ -16,6 +16,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 # Keys that we have already warned about in concat_batch, so each missing key
 # only produces a single warning per process (avoid log spam in the replay /
@@ -144,6 +145,24 @@ def stack_list_of_dict_tensor(list_of_dict: list, dim=0):
         _v0 = list_of_dict[0][key]
         if isinstance(_v0, torch.Tensor):
             v_list = [d[key] for d in list_of_dict]
+            # Pad tensors to uniform shape if they differ
+            shapes = [v.shape for v in v_list]
+            if len(set(shapes)) > 1:
+                ndim = _v0.ndim
+                max_shape = [max(s[d] for s in shapes) for d in range(ndim)]
+                padded = []
+                for v in v_list:
+                    # Build F.pad argument: pairs (pad_before, pad_after) for last N dims
+                    pad_args = []
+                    for d in reversed(range(ndim)):
+                        if v.shape[d] < max_shape[d]:
+                            pad_args.extend([0, max_shape[d] - v.shape[d]])
+                        else:
+                            pad_args.extend([0, 0])
+                    if any(p > 0 for p in pad_args):
+                        v = F.pad(v, pad_args)
+                    padded.append(v)
+                v_list = padded
             ret[key] = torch.stack(v_list, dim=dim)
         elif isinstance(_v0, dict):
             v_list = [d[key] for d in list_of_dict]
@@ -172,6 +191,23 @@ def cat_list_of_dict_tensor(list_of_dict: list, dim=0):
         v_list = [d[key] for d in list_of_dict]
 
         if isinstance(_v0, torch.Tensor):
+            # Pad tensors to match shapes along non-concat dimensions if needed
+            shapes = [v.shape for v in v_list]
+            if len(set(shapes)) > 1:
+                ndim = _v0.ndim
+                max_shape = [max(s[d] for s in shapes) for d in range(ndim)]
+                padded = []
+                for v in v_list:
+                    pad_args = []
+                    for d in reversed(range(ndim)):
+                        if v.shape[d] < max_shape[d]:
+                            pad_args.extend([0, max_shape[d] - v.shape[d]])
+                        else:
+                            pad_args.extend([0, 0])
+                    if any(p > 0 for p in pad_args):
+                        v = F.pad(v, pad_args)
+                    padded.append(v)
+                v_list = padded
             ret[key] = torch.cat(v_list, dim=dim)
         elif isinstance(_v0, np.ndarray):
             ret[key] = np.concatenate([v for v in v_list if v is not None], axis=dim)

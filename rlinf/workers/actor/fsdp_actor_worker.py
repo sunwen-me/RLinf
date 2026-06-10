@@ -1380,6 +1380,25 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     prev_values = batch.get("prev_values", None)
                     loss_mask = batch.get("loss_mask", None)
                     loss_mask_sum = batch.get("loss_mask_sum", None)
+                    # loss_mask from rollout has shape [n_chunk_step, B, 1].
+                    # Squeeze n_chunk_step dim so it becomes [B, 1],
+                    # compatible with logprobs/entropy of shape [B, C, D].
+                    if loss_mask is not None:
+                        # loss_mask may be [n_chunk_step, B, 1] (3D) or [B, 1] (2D).
+                        # Need [B, 1, 1] to broadcast with entropy [B, C, D].
+                        if loss_mask.ndim == 3:
+                            loss_mask = loss_mask.squeeze(0)
+                        if loss_mask.ndim == 1:
+                            loss_mask = loss_mask.unsqueeze(-1)
+                        if loss_mask.ndim == 2:
+                            loss_mask = loss_mask.unsqueeze(-1)
+                    if loss_mask_sum is not None:
+                        if loss_mask_sum.ndim == 3:
+                            loss_mask_sum = loss_mask_sum.squeeze(0)
+                        if loss_mask_sum.ndim == 1:
+                            loss_mask_sum = loss_mask_sum.unsqueeze(-1)
+                        if loss_mask_sum.ndim == 2:
+                            loss_mask_sum = loss_mask_sum.unsqueeze(-1)
 
                     forward_inputs = batch.get("forward_inputs", None)
 
