@@ -92,6 +92,7 @@ def get_model(
 
     # XR0-specific config (with defaults matching the original XR0 config)
     xr0_cfg = getattr(cfg, "xr0", cfg)
+    local_window = getattr(xr0_cfg, "local_window", 4)
     action_shape = tuple(
         getattr(xr0_cfg, "action_shape", [num_action_chunks, action_dim])
     )
@@ -168,6 +169,7 @@ def get_model(
         action_env_dim=action_env_dim,
         action_mapper=action_mapper,
         train_expert_only=train_expert_only,
+        local_window=local_window,
     )
 
     return policy

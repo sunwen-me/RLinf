@@ -1831,10 +1831,23 @@ class MiBoTForActionGeneration(PreTrainedModel):
         )
         position_embeds = self.rotary_emb(action_mask, position_ids)
 
-        ## cache attention mask
-        dit_mask = torch.tril(torch.ones((action_bs, dit_query_length, dit_query_length), device=action_mask.device), diagonal=0)
+        ## cache attention mask with local causal window
+        s_len = state_length + 1
+        a_len = action_length
+        mask_ss = torch.tril(torch.ones(s_len, s_len, device=action_mask.device))
+        mask_sa = torch.zeros(s_len, a_len, device=action_mask.device)
+        mask_as = torch.ones(a_len, s_len, device=action_mask.device)
+        mask_aa = torch.tril(torch.ones(a_len, a_len, device=action_mask.device))
+        local_window = getattr(self, 'local_window', 4)
+        mask_aa = mask_aa * torch.triu(
+            torch.ones(a_len, a_len, device=action_mask.device), diagonal=-local_window
+        )
+        causal_mask = torch.cat(
+            [torch.cat([mask_ss, mask_sa], dim=1),
+             torch.cat([mask_as, mask_aa], dim=1)], dim=0,
+        )
         cache_mask = vlm_outputs.attention_mask[:, None, :].expand(-1, dit_query_length, -1)
-        attn_mask = torch.cat([cache_mask, dit_mask], dim=-1)[:, None]
+        attn_mask = torch.cat([cache_mask, causal_mask[None].expand(action_bs, -1, -1)], dim=-1)[:, None]
         attn_mask = attn_mask.bool()
 
         ## state

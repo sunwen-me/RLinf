@@ -92,6 +92,7 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         noise_method: str = "flow_sde",
         action_env_dim: Optional[int] = None,
         action_mapper: Optional[ActionMapper] = None,
+        local_window: int = 4,
         train_expert_only: bool = False,
         robot_type: str = "libero_all",
     ):
@@ -109,6 +110,7 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         # Must match Xiaomi server input_data["task_id"].
         # Used by processor.get_action_mask(...) and processor.decode_action(...).
         self.robot_type = robot_type
+        self.local_window = local_window
 
         # Action mapper: handles 32D <-> env_dim conversion with valid_action_mask.
         # Takes precedence over action_env_dim (simple slicing).
@@ -715,10 +717,25 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         # Position embeds (same as checkpoint forward line 1832)
         position_embeds = self.xr0_model.rotary_emb(action_mask, position_ids)
 
-        # Attention mask (same as checkpoint forward line 1835-1838)
-        dit_mask = torch.tril(torch.ones((batch_size, dit_query_length, dit_query_length), device=device), diagonal=0)
+        # Attention mask with local causal window for action tokens
+        state_len = state_tensor.shape[1] if state_tensor is not None else 1
+        s_len = state_len + 1  # +1 for sink token
+        a_len = action_len
+        mask_ss = torch.tril(torch.ones(s_len, s_len, device=device))
+        mask_sa = torch.zeros(s_len, a_len, device=device)
+        mask_as = torch.ones(a_len, s_len, device=device)
+        mask_aa = torch.tril(torch.ones(a_len, a_len, device=device))
+        mask_aa = mask_aa * torch.triu(
+            torch.ones(a_len, a_len, device=device), diagonal=-self.local_window
+        )
+        causal_mask = torch.cat(
+            [torch.cat([mask_ss, mask_sa], dim=1),
+             torch.cat([mask_as, mask_aa], dim=1)], dim=0,
+        )
         cache_mask = vlm_outputs.attention_mask[:, None, :].expand(-1, dit_query_length, -1)
-        attn_mask = torch.cat([cache_mask, dit_mask], dim=-1)[:, None].bool()
+        attn_mask = torch.cat(
+            [cache_mask, causal_mask[None].expand(batch_size, -1, -1)], dim=-1
+        )[:, None].bool()
 
         # State embedding
         state_embed = self.xr0_model.state_projector(
@@ -930,12 +947,24 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         )
         position_embeds = model.rotary_emb(action_mask, position_ids)
 
-        # Attention mask (matches checkpoint line 1835-1838)
-        dit_mask = torch.tril(
-            torch.ones((action_bs, dit_query_length, dit_query_length), device=action_mask.device), diagonal=0
+        # Attention mask with local causal window for action tokens
+        s_len = state_length + 1  # +1 for sink token
+        a_len = action_length
+        mask_ss = torch.tril(torch.ones(s_len, s_len, device=action_mask.device))
+        mask_sa = torch.zeros(s_len, a_len, device=action_mask.device)
+        mask_as = torch.ones(a_len, s_len, device=action_mask.device)
+        mask_aa = torch.tril(torch.ones(a_len, a_len, device=action_mask.device))
+        mask_aa = mask_aa * torch.triu(
+            torch.ones(a_len, a_len, device=action_mask.device), diagonal=-self.local_window
+        )
+        causal_mask = torch.cat(
+            [torch.cat([mask_ss, mask_sa], dim=1),
+             torch.cat([mask_as, mask_aa], dim=1)], dim=0,
         )
         cache_mask = vlm_outputs.attention_mask[:, None, :].expand(-1, dit_query_length, -1)
-        attn_mask = torch.cat([cache_mask, dit_mask], dim=-1)[:, None].bool()
+        attn_mask = torch.cat(
+            [cache_mask, causal_mask[None].expand(action_bs, -1, -1)], dim=-1
+        )[:, None].bool()
 
         # State embedding
         state_embed = model.state_projector(state)
@@ -1266,8 +1295,12 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         mask_ss = torch.tril(torch.ones(s_len, s_len, device=device))
         mask_sa = torch.zeros(s_len, a_len, device=device)
         mask_as = torch.ones(a_len, s_len, device=device)
-        # Full causal mask: matches checkpoint training mask (modeling_mibot.py:1832).
+        # P2_Local-style local causal mask: each action token attends to
+        # at most local_window previous tokens (matches original XR0.py).
         mask_aa = torch.tril(torch.ones(a_len, a_len, device=device))
+        mask_aa = mask_aa * torch.triu(
+            torch.ones(a_len, a_len, device=device), diagonal=-self.local_window
+        )
         causal_mask = torch.cat(
             [torch.cat([mask_ss, mask_sa], dim=1),
              torch.cat([mask_as, mask_aa], dim=1)],
