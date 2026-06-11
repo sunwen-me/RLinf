@@ -59,6 +59,8 @@ xr0:
   dit_num_layers: 16
   dit_hidden_size: 1024
   local_window: 4
-  training_repeat: 4
+  async_train: false  # Enable for async RL training (prefix-based partial replay)
+  training_repeat: 1  # Batch augmentation (supervised pretraining only)
+  freq_coefficient: 0.0  # Frequency-domain loss weight (0 = disabled)
   enable_freq: false
   flow_sampling: "beta"

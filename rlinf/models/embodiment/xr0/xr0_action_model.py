@@ -93,6 +93,9 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         action_env_dim: Optional[int] = None,
         action_mapper: Optional[ActionMapper] = None,
         local_window: int = 4,
+        async_train: bool = False,
+        training_repeat: int = 1,
+        freq_coefficient: float = 0.0,
         train_expert_only: bool = False,
         robot_type: str = "libero_all",
     ):
@@ -111,6 +114,10 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         # Used by processor.get_action_mask(...) and processor.decode_action(...).
         self.robot_type = robot_type
         self.local_window = local_window
+        self.async_train = async_train
+        self.training_repeat = training_repeat
+        self.freq_coefficient = freq_coefficient
+        self.prefix_mask_prob = 0.5
 
         # Action mapper: handles 32D <-> env_dim conversion with valid_action_mask.
         # Takes precedence over action_env_dim (simple slicing).
@@ -460,6 +467,45 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             # Truncate
             return state[..., :expected_dim]
 
+    def _random_mask_prefix(
+        self,
+        causal_mask: torch.Tensor,
+        prefix_length: int,
+        state_length: int,
+        keep_last_k: int = 2,
+    ) -> torch.Tensor:
+        """Randomly mask prefix tokens in the causal mask for async training.
+
+        Prevents the model from directly copying prefix values — it must
+        understand the action sequence semantically.  Keeps the last
+        ``keep_last_k`` prefix tokens always visible (most recent execution
+        results are most important).
+
+        Args:
+            causal_mask: ``(B, q_len, q_len)`` attention mask.
+            prefix_length: Number of prefix (already-executed) tokens.
+            state_length: Number of state tokens (excluding sink).
+            keep_last_k: Number of prefix tokens to always keep visible.
+
+        Returns:
+            Modified causal mask with some prefix tokens masked out.
+        """
+        if prefix_length <= keep_last_k:
+            return causal_mask
+
+        action_start = 1 + state_length  # +1 for sink token
+        masked_prefix_end = action_start + prefix_length - keep_last_k
+        suffix_start = action_start + prefix_length
+
+        if suffix_start >= causal_mask.shape[-1]:
+            return causal_mask
+
+        causal_mask = causal_mask.clone()
+        num_maskable = prefix_length - keep_last_k
+        rand_mask = torch.rand(num_maskable, device=causal_mask.device) < self.prefix_mask_prob
+        causal_mask[:, suffix_start:, action_start:masked_prefix_end] *= (~rand_mask).int()
+        return causal_mask
+
     # ------------------------------------------------------------------
     # Log-probability helpers (for RL training)
     # ------------------------------------------------------------------
@@ -502,6 +548,32 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         entropy = 0.5 * torch.log(2 * math.pi * math.e * sigma_safe**2)
         entropy = torch.where(mask, torch.zeros_like(entropy), entropy)
         return entropy
+
+    def compute_frequency_loss(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        weight: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Frequency-domain loss: penalizes spectral differences between pred and target.
+
+        Encourages smooth action sequences by penalizing high-frequency noise.
+
+        Args:
+            pred: Predicted action ``(B, L, D)``.
+            target: Target action ``(B, L, D)``.
+            weight: Optional per-element weight ``(B, L, D)``.
+
+        Returns:
+            Scalar frequency loss.
+        """
+        pred = pred.float()
+        target = target.float()
+        loss_freq = (torch.fft.rfft(pred, dim=1) - torch.fft.rfft(target, dim=1)).abs()
+        if weight is not None:
+            weight_dct = weight.float().mean(dim=[1, 2])
+            loss_freq = (loss_freq * weight_dct.unsqueeze(1).unsqueeze(2))
+        return loss_freq.mean()
 
     # ------------------------------------------------------------------
     # Flow-SDE denoising helpers
@@ -736,6 +808,25 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         attn_mask = torch.cat(
             [cache_mask, causal_mask[None].expand(batch_size, -1, -1)], dim=-1
         )[:, None].bool()
+
+        # Async train: randomly set prefix_length for partial replay
+        prefix_length = 0
+        if mode == "train" and self.async_train and random.random() < 0.5:
+            prefix_length = random.randint(1, min(6, action_len))
+
+        # Apply random mask to prefix tokens if prefix_length > 2
+        if mode == "train" and prefix_length > 2:
+            causal_mask_for_prefix = self._random_mask_prefix(
+                causal_mask[None].expand(batch_size, -1, -1),
+                prefix_length, state_len,
+            )
+            attn_mask = torch.cat(
+                [cache_mask, causal_mask_for_prefix], dim=-1
+            )[:, None].bool()
+
+        # Offset position IDs for non-prefix tokens (original XR0.py line 749-750)
+        if prefix_length > 0 and action_len > prefix_length:
+            position_ids[:, :, -(action_len - prefix_length):] += 10
 
         # State embedding
         state_embed = self.xr0_model.state_projector(
@@ -1090,6 +1181,7 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         forward_inputs: dict[str, Any] = {
             "chains": outputs["chains"].cpu(),
             "denoise_inds": outputs["denoise_inds"].cpu(),
+            "prefix_length": torch.tensor([prefix_length]),
         }
         for k, v in vlm_batch.items():
             if isinstance(v, torch.Tensor):
@@ -1176,6 +1268,7 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
 
         chains = forward_inputs.get("chains")  # (B, num_steps+1, C, D)
         denoise_inds = forward_inputs.get("denoise_inds")  # (B,)
+        prefix_length = int(forward_inputs.get("prefix_length", torch.tensor([0])).item())
 
         def _compute_values(batch_size: int) -> torch.Tensor:
             """Compute values from VLM hidden states if available."""
@@ -1310,6 +1403,20 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             [cache_mask, causal_mask[None].expand(batch_size, -1, -1)], dim=-1
         )[:, None].bool()
 
+        # Apply prefix masking (must match sample_actions for consistency)
+        if prefix_length > 2:
+            causal_mask_prefixed = self._random_mask_prefix(
+                causal_mask[None].expand(batch_size, -1, -1),
+                prefix_length, state_len,
+            )
+            attn_mask = torch.cat(
+                [cache_mask, causal_mask_prefixed], dim=-1
+            )[:, None].bool()
+
+        # Offset position IDs for non-prefix tokens (must match sample_actions)
+        if prefix_length > 0 and action_len > prefix_length:
+            position_ids[:, :, -(action_len - prefix_length):] += 10
+
         # State embedding (pad/truncate to match model's expected dim)
         state_tensor_padded = self._pad_state(state_tensor)
         state_embed = self.xr0_model.state_projector(
@@ -1359,6 +1466,10 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
                 x_t, t_tensor, action_mask, state_embed,
                 position_embeds, past_key_values, attn_mask,
             )
+
+        # Zero out prefix positions (original XR0.py line 618-619)
+        if prefix_length > 0:
+            v_t[:, :prefix_length] = 0.0
 
         # Compute mean and std using Flow-SDE (no sampling — we need the
         # exact mean to evaluate logprob of the recorded x_next).
