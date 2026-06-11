@@ -74,12 +74,8 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         noise_level: Noise level for flow-SDE (default 0.5).
 
     TODO: Add π_RL-style learnable noise network (ExploreNoiseNet) for
-    Flow-Noise method. Currently uses fixed noise_level. See lingbotvla
-    for reference implementation with flow_noise / flow_sde / flow_cps.
-    TODO: Add Flow-SDE method (ODE-to-SDE conversion) for better RL
-    exploration. See lingbotvla.sample_mean_var_val for reference.
-    TODO: Add value head (ValueHead MLP) for PPO critic. Currently
-    values are stub zeros. Use rlinf.models.embodiment.modules.value_head.
+    Flow-Noise method. Currently uses fixed noise_level (flow_sde).
+    See lingbotvla for reference implementation with flow_noise.
     """
 
     def __init__(
@@ -150,9 +146,6 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         # Cached VLM KV from the most recent sample_actions call.
         # Only used as fallback when forward_inputs doesn't have packed KV,
         # and only when batch sizes match exactly.
-        self._cached_vlm_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None
-        self._cached_vlm_pos_max: torch.Tensor | None = None
-
         # Value head for PPO critic (uses VLM hidden states)
         if add_value_head:
             # Get VLM hidden size from model config
@@ -749,7 +742,7 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             else:
                 # Skip the last step (lowest sigma) to reduce instability.
                 # With num_steps=5: choose from [0,1,2,3] instead of [0,1,2,3,4].
-                denoise_ind = random.randint(0, self.num_steps - 2)
+                denoise_ind = random.randint(0, max(self.num_steps - 2, 0))
         else:
             denoise_ind = -1  # all deterministic
 
@@ -956,10 +949,9 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         if gpu_rng is not None:
             torch.cuda.set_rng_state(gpu_rng, action_mask.device)
 
-        num_steps = 5
-        dt = 1.0 / num_steps
-        for step in range(num_steps):
-            t = torch.ones((x.shape[0], 1, 1), device=x.device, dtype=x.dtype) * step / num_steps
+        dt = 1.0 / self.num_steps
+        for step in range(self.num_steps):
+            t = torch.ones((x.shape[0], 1, 1), device=x.device, dtype=x.dtype) * step / self.num_steps
             v = model.dit_forward(x, t, action_mask, state_embed, position_embeds, past_key_values, attn_mask)
             x = x + v * dt
 
@@ -1222,14 +1214,6 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             vlm_pos_max = self._unpack_vlm_pos_max(
                 forward_inputs["vlm_pos_max"], batch_size, device,
             )
-        elif (
-            self._cached_vlm_kv is not None
-            and self._cached_vlm_pos_max is not None
-            and self._cached_vlm_kv[0][0].shape[0] == batch_size
-        ):
-            # Only use local cache when its batch size matches current micro-batch.
-            past_key_values = self._cached_vlm_kv
-            vlm_pos_max = self._cached_vlm_pos_max
         else:
             # Fallback: re-run VLM forward (e.g. for eval).
             self.logger.warning(
@@ -1337,12 +1321,11 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         t_tensor = t_val.view(1, 1, 1).expand(
             batch_size, 1, 1
         ).to(dtype=torch.bfloat16)
-        self.xr0_model.eval()
-        v_t = self.xr0_model.dit_forward(
-            x_t, t_tensor, action_mask, state_embed,
-            position_embeds, past_key_values, attn_mask,
-        )
-        self.xr0_model.train()
+        with _temporarily_eval(self.xr0_model):
+            v_t = self.xr0_model.dit_forward(
+                x_t, t_tensor, action_mask, state_embed,
+                position_embeds, past_key_values, attn_mask,
+            )
 
         # Compute mean and std using Flow-SDE (no sampling — we need the
         # exact mean to evaluate logprob of the recorded x_next).

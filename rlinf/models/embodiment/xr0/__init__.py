@@ -102,15 +102,12 @@ def get_model(
         logger.info("Using stub XR0 model (model_path=dummy)")
         xr0_model = _StubXR0(action_shape=action_shape, num_steps=num_steps)
     else:
-        from transformers import AutoModel
+        from .model.modeling_mibot import MiBoTForActionGeneration
 
         logger.info("Loading XR0 model from %s", model_path)
-        # Use torch_dtype (not dtype) to avoid JSON serialization issues
-        # in transformers >=4.53 when repr(config) is called during loading.
         _dtype = torch_dtype or torch.bfloat16
-        xr0_model = AutoModel.from_pretrained(
+        xr0_model = MiBoTForActionGeneration.from_pretrained(
             model_path,
-            trust_remote_code=True,
             torch_dtype=_dtype,
         )
 

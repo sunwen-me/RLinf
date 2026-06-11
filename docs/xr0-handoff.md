@@ -70,59 +70,37 @@ tests/unit_tests/
 | Value Head | ✅ | VLM hidden states → PPO critic |
 | Flow-SDE完整版 | ✅ | σ=a√(τ/(1-τ)) + 漂移修正 |
 | FSDP修复 | ✅ | _no_split_modules类名修正 |
-| default_forward | ❌ | **past_key_values有None条目** |
+| default_forward | ✅ | 已修复：gradient_checkpointing + torch.no_grad()，KV cache已序列化 |
 | 可学习噪声 | ❌ | TODO |
 | 文档/CI | ❌ | TODO |
 
-## 当前阻塞问题：default_forward past_key_values None
+## ~~当前阻塞问题：default_forward past_key_values None~~ ✅ 已修复
 
-### 症状
+### 原问题
 
-训练阶段 actor worker 调用 `default_forward` 重放去噪链时崩溃：
+训练阶段 actor worker 调用 `default_forward` 重放去噪链时崩溃，`past_key_values` 含 `None` 条目。
 
-```
-File "modeling_mibot.py", line 1644, in forward
-    k_cache = repeat_kv(k_cache, self.num_key_value_groups)
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-AttributeError: 'NoneType' object has no attribute 'shape'
-```
+### 根因
 
-### 根因分析
+transformers 4.57 的 `@check_model_inputs` 装饰器，在 `gradient_checkpointing=True` 且 `self.training=True` 时，**静默**将 `use_cache` 强制设为 `False`，导致 VLM forward 返回空 KV cache。
 
-`default_forward` 重放流程：
-1. 从 `forward_inputs` 恢复 VLM batch（input_ids, pixel_values, image_grid_thw）
-2. 调用 `self.xr0_model.vlm(**vlm_batch, use_cache=True)` 获取 KV cache
-3. 将 `past_key_values` 传给 `dit_forward` 做去噪
+### 修复（commit e637c186）
 
-问题出在步骤 2-3：VLM 的 `past_key_values` 中某些层的 key/value 是 `None`，传给 DiT 的 attention 层后 `repeat_kv` 崩溃。
+1. VLM forward 前临时关闭所有子模块的 `gradient_checkpointing`
+2. 用 `torch.no_grad()` 跑 VLM forward（梯度只走 DiT）
+3. `try/finally` 恢复 `gradient_checkpointing` 状态
 
-### 可能原因
+### 后续优化
 
-1. **VLM KV cache 格式不兼容**：Qwen3-VL 的 `past_key_values` 可能使用了 `HybridCache`（transformers 4.57+），其中某些层（如 sliding window 层）的 cache 为 `None`。
-2. **DiT 不应使用 VLM 的 KV cache**：DiT 有自己的 attention 层，应该独立构建 KV cache，而不是复用 VLM 的。`sample_actions` 中的 `dit_forward` 传入的 `past_key_values` 来自 VLM，但 DiT 的 attention 层可能期望不同的格式。
-3. **pixel_values 缺失或格式错误**：如果 `forward_inputs` 中的 `pixel_values` 经过 split 后格式不对，VLM forward 可能产生不完整的 cache。
+KV cache 已序列化到 `forward_inputs`（`_pack_vlm_kv` / `_unpack_vlm_kv`），训练时 `default_forward` 主路径直接解包复用，不再重跑 VLM，彻底绕过此问题。PPO 训练已验证通过（2026-06-10）。
 
-### 调试建议
+## 去噪公式说明
 
-1. 在 `default_forward` 的 `vlm_outputs = self.xr0_model.vlm(**vlm_batch, use_cache=True)` 之后，检查 `past_key_values` 中是否有 `None` 条目：
-   ```python
-   for i, (k, v) in enumerate(past_key_values):
-       if k is None or v is None:
-           print(f"Layer {i}: k={k}, v={v}")
-   ```
+`_compute_denoise_mean_std` 中 eval 模式使用 Euler-step 公式 `x_t + v_t * δ`，与 `_fixed.py` / `_patched` 中的端点插值公式 `x0_pred * w0 + x1_pred * w1` 数学上等价（在真实 velocity field 下均为 `x_t - v_true * δ`）。
 
-2. 对比 `sample_actions`（rollout时正常工作）和 `default_forward`（训练时崩溃）的 VLM batch 内容，看是否有差异。
+当前 Euler-step 公式与 checkpoint 的推理循环（`_flow_generate` / `_checkpoint_forward_eval`：`x = x + v * dt`）保持一致，是正确实现。训练时走 `mode="train"` 分支（flow_sde），两边公式完全相同，不存在 train-eval 不一致。
 
-3. 检查 `modeling_mibot.py` 中 DiT 的 attention 层如何使用 `past_key_values`，是否需要做格式转换。
-
-4. 如果 VLM KV cache 不能直接传给 DiT，可能需要在 `default_forward` 中重新实现 DiT 的 KV cache 管理，参考 `sample_actions` 中的实现。
-
-### 参考文件
-
-- `modeling_mibot.py:1644` — `repeat_kv` 崩溃点
-- `modeling_mibot.py:1697` — DiT attention 调用
-- `xr0_action_model.py:820-835` — `default_forward` VLM forward
-- `xr0_action_model.py:543-563` — `sample_actions` DiT forward（正常工作）
+**开发中间文件**（`xr0_action_model.py.bak`、`xr0_action_model_fixed.py`、`xr0_action_model_patched (1).py`）为迭代调试产物，不再维护，可安全删除。
 
 ## 参考实现
 
@@ -177,4 +155,4 @@ conda run -n rlinf python -m pytest tests/unit_tests/test_xr0_model_registration
 feat/xr0-vla  →  https://github.com/sunwen-me/RLinf/tree/feat/xr0-vla
 ```
 
-7个commit，全部已push。
+18个commit，全部已push。
