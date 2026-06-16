@@ -832,15 +832,22 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         if mode == "train" and self.async_train and random.random() < 0.5:
             prefix_length = random.randint(1, min(6, action_len))
 
-        # Apply random mask to prefix tokens if prefix_length > 2
+        # Apply random mask to prefix tokens if prefix_length > 2.
+        # Seed RNG with prefix_length so the mask is deterministic and can be
+        # exactly reproduced in default_forward during training replay.
         if mode == "train" and prefix_length > 2:
-            causal_mask_for_prefix = self._random_mask_prefix(
-                causal_mask[None].expand(batch_size, -1, -1),
-                prefix_length, state_len,
-            )
-            attn_mask = torch.cat(
-                [cache_mask, causal_mask_for_prefix], dim=-1
-            )[:, None].bool()
+            _rng_state = torch.random.get_rng_state()
+            torch.manual_seed(prefix_length)
+            try:
+                causal_mask_for_prefix = self._random_mask_prefix(
+                    causal_mask[None].expand(batch_size, -1, -1),
+                    prefix_length, state_len,
+                )
+                attn_mask = torch.cat(
+                    [cache_mask, causal_mask_for_prefix], dim=-1
+                )[:, None].bool()
+            finally:
+                torch.random.set_rng_state(_rng_state)
 
         # Offset position IDs for non-prefix tokens (original XR0.py line 749-750)
         if prefix_length > 0 and action_len > prefix_length:
@@ -909,6 +916,11 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
                 x_t, t_tensor, action_mask, state_embed,
                 position_embeds, past_key_values, attn_mask,
             )
+            # Zero out prefix positions — must match default_forward replay
+            # so that recorded chain and training logprob mean are consistent.
+            if prefix_length > 0:
+                v_t[:, :prefix_length] = 0.0
+
             if idx == 0:
                 self.logger.debug("[DENOISE_DBG] step0 v_t[0,0,:7]=%s max_abs=%.4f",
                     v_t[0,0,:7].float().tolist(), v_t.float().abs().max().item())
@@ -1127,8 +1139,19 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         states = env_obs["states"]
         task_descriptions = env_obs.get("task_descriptions") or [""] * len(images)
         batch_size = len(images)
-        # Match Xiaomi server: robot_type comes from input_data["task_id"].
-        robot_type = env_obs.get("task_id") or env_obs.get("robot_type") or self.robot_type
+        # robot_type determines action_mask and decode_action stats.
+        # IMPORTANT: rollout and training replay must use the same robot_type.
+        # Since default_forward() always uses self.robot_type (strings can't
+        # be stored in forward_inputs), we must ensure consistency here.
+        env_robot_type = env_obs.get("task_id") or env_obs.get("robot_type")
+        if env_robot_type is not None and env_robot_type != self.robot_type:
+            self.logger.warning(
+                "env_obs provides robot_type=%s but model is configured with "
+                "robot_type=%s. Using model's robot_type for consistency with "
+                "training replay. Set robot_type in model config to match env.",
+                env_robot_type, self.robot_type,
+            )
+        robot_type = self.robot_type
 
         # State tensor: (B, 1, STATE_DIM)
         state_tensor = torch.from_numpy(np.asarray(states, dtype=np.float32))
@@ -1161,7 +1184,15 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             out = self._checkpoint_forward_eval(st, action_mask, vlm_inputs, rollout_seed)
             raw_actions_cpu = out.actions.float().cpu()
             actions_np = proc.decode_action(raw_actions_cpu, robot_type=robot_type).numpy()
-            env_actions_np = actions_np[:, :self.num_action_chunks, : self.action_env_dim]
+            # Use action_mapper for eval too (same as train path).
+            # Without this, SO101 eval would slice the first 12 dims instead
+            # of the correct [7..11,6, 21..25,20] mapping.
+            if self.action_mapper is not None:
+                env_actions_np = self.action_mapper.map_to_env(
+                    torch.from_numpy(actions_np)
+                ).numpy()
+            else:
+                env_actions_np = actions_np[:, :self.num_action_chunks, : self.action_env_dim]
             result = {
                 "prev_logprobs": torch.zeros(batch_size, self.num_action_chunks, self.action_dim),
                 "prev_values": torch.zeros(batch_size),
@@ -1616,10 +1647,21 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             ("Base View", main_images),
         ]
 
-        # Explicit wrist_images (LIBERO produces this directly)
+        # Explicit wrist_images (LIBERO produces (B,H,W,C), some envs produce (B,N,H,W,C))
         wrist_images = env_obs.get("wrist_images")
         if wrist_images is not None and len(wrist_images) > 0:
-            views.append(("Left-Wrist View", wrist_images))
+            ndim = getattr(wrist_images, "ndim", 0)
+            if ndim == 5:
+                # (B, num_views, H, W, C) — split into individual views
+                num_views = wrist_images.shape[1]
+                for vi in range(min(num_views, 3)):
+                    label = "Left-Wrist View" if vi == 0 else (
+                        "Right-Wrist View" if vi == 1 else f"Wrist View {vi}"
+                    )
+                    views.append((label, wrist_images[:, vi]))
+            else:
+                # (B, H, W, C) — single wrist view
+                views.append(("Left-Wrist View", wrist_images))
         else:
             # Fallback: ManiSkill puts wrist cameras in extra_view_images
             # Shape: (B, num_views, H, W, C)
