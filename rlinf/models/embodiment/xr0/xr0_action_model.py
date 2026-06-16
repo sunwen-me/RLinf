@@ -39,7 +39,7 @@ from rlinf.models.embodiment.modules.value_head import ValueHead
 from rlinf.utils.logging import get_logger
 
 from .action_mapping import ActionMapper, get_action_mapper
-from .utils import ACTION_DIM, denormalize_action, resize_image
+from .utils import ACTION_DIM
 
 
 @contextmanager
@@ -550,6 +550,8 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         entropy = torch.where(mask, torch.zeros_like(entropy), entropy)
         return entropy
 
+    # XXX: not yet wired into the training loss.  Kept for future use
+    # when freq_coefficient > 0 is needed to smooth action sequences.
     def compute_frequency_loss(
         self,
         pred: torch.Tensor,
@@ -604,9 +606,6 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
 
         t_input = t_val.view(1, 1, 1).expand_as(x_t).to(dtype=orig_dtype)
         delta_input = delta.view(1, 1, 1).expand_as(x_t).to(dtype=orig_dtype)
-
-        x0_pred = x_t - v_t * t_input
-        x1_pred = x_t + v_t * (1 - t_input)
 
         if mode == "eval":
             # Euler step: x_{t+1} = x_t + v * delta (matches checkpoint forward)
@@ -710,14 +709,10 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         # --- Real model: step-by-step denoising ---
         # Use eval mode to disable dropout/BN randomness.  Policy stochasticity
         # comes from Flow-SDE noise, not from dropout.
-        # try/finally ensures train mode is always restored, even on error.
-        self.xr0_model.eval()
-        try:
+        with _temporarily_eval(self.xr0_model):
             return self._sample_actions_real(
                 vlm_batch, state_tensor, device, mode, robot_type, seed,
             )
-        finally:
-            self.xr0_model.train()
 
     def _sample_actions_real(
         self,
@@ -753,8 +748,8 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
                 **vlm_inputs, use_cache=True, output_hidden_states=True
             )
         finally:
-            for module, state in gc_states:
-                module.gradient_checkpointing = state
+            for module, gc_state in gc_states:
+                module.gradient_checkpointing = gc_state
         past_key_values = list(vlm_outputs.past_key_values)
 
         # Pack KV cache into flat tensors for forward_inputs transport.
@@ -772,7 +767,9 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             else:
                 vlm_hidden_states = vlm_outputs.hidden_states
         else:
-            # Fallback: run a separate VLM forward with output_hidden_states=True
+            # Fallback: run a separate VLM forward with output_hidden_states=True.
+            # use_cache=False avoids the transformers 4.57 gc+use_cache conflict,
+            # so no additional gc_states protection is needed here.
             vlm_outputs2 = self.xr0_model.vlm(**vlm_inputs, use_cache=False, output_hidden_states=True)
             if hasattr(vlm_outputs2, "hidden_states") and vlm_outputs2.hidden_states is not None:
                 vlm_hidden_states = vlm_outputs2.hidden_states[-1] if isinstance(vlm_outputs2.hidden_states, tuple) else vlm_outputs2.hidden_states
@@ -898,7 +895,7 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
 
         for idx in range(self.num_steps):
             t_val = timesteps[idx]
-            if idx == 0:
+            if idx == 0 and batch_size > 0:
                 self.logger.debug("[DENOISE_DBG] step0 x_t[0,0,:5]=%s attn_mask=%s pos_embeds=%s",
                     x_t[0,0,:5].float().tolist(),
                     tuple(attn_mask.shape),
@@ -1052,8 +1049,8 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         try:
             vlm_outputs = vlm_module(**vlm_inputs, use_cache=True)
         finally:
-            for module, state in gc_states:
-                module.gradient_checkpointing = state
+            for module, gc_state in gc_states:
+                module.gradient_checkpointing = gc_state
         past_key_values = list(vlm_outputs.past_key_values)
 
         action_bs, action_length, _ = action_mask.shape
@@ -1405,8 +1402,11 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         else:
             cache_attn_mask = torch.ones(batch_size, 1, device=device, dtype=torch.long)
 
-        # Build position ids and attention mask (same as sample_actions)
-        action_len = self.num_action_chunks
+        # Build position ids and attention mask (same as sample_actions).
+        # action_len must come from the processor's action_mask, not
+        # num_action_chunks, to stay consistent with sample_actions.
+        action_mask_base = self._get_action_mask(device, robot_type=robot_type)
+        action_len = action_mask_base.shape[1]
         state_len = state_tensor.shape[1] if state_tensor is not None else 1
         q_len = action_len + state_len + 1
         position_ids = (
@@ -1472,9 +1472,7 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         )
         position_embeds = self.xr0_model.rotary_emb(dummy_action, position_ids)
 
-        # Action mask from processor (same as sample_actions)
-        action_mask_base = self._get_action_mask(device, robot_type=robot_type)
-        action_len = action_mask_base.shape[1]
+        # Action mask already fetched above; expand for batch.
         action_mask = action_mask_base.expand(batch_size, -1, -1)
 
         timesteps = torch.linspace(
