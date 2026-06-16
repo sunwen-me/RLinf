@@ -1125,6 +1125,12 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
 
         images = env_obs["main_images"]
         wrist_images = env_obs.get("wrist_images")  # optional
+        # Fallback: ManiSkill puts wrist cameras in extra_view_images (B, V, H, W, C).
+        # Take the first view as the left-wrist image for XR0's two-view prompt.
+        if wrist_images is None:
+            extra_views = env_obs.get("extra_view_images")
+            if extra_views is not None and extra_views.ndim == 5:
+                wrist_images = extra_views[:, 0]  # (B, H, W, C)
         states = env_obs["states"]
         task_descriptions = env_obs.get("task_descriptions") or [""] * len(images)
         batch_size = len(images)

@@ -18,6 +18,11 @@ video_cfg:
 enable_offload: False
 init_params:
   id: "DualSO100LemonCupScene-v1"
+  # Use SO101 robots instead of default SO100.
+  # Without this override, the task class defaults to ("so100_wristcam", "so100_wristcam").
+  robot_uids:
+    - "so101_wristcam"
+    - "so101_wristcam"
   num_envs: null
   obs_mode: "rgb"
   control_mode: null

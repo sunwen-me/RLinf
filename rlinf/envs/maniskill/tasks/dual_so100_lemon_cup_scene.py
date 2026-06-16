@@ -329,7 +329,10 @@ class DualSO100LemonCupScene(BaseEnv):
             dynamic_friction=f["gripper_dynamic"],
             restitution=0.0,
         )
-        finger_links = ["Fixed_Jaw", "Moving_Jaw"]
+        # Try both SO100 and SO101 link names.
+        # SO100: "Fixed_Jaw" / "Moving_Jaw"
+        # SO101: "gripper" / "jaw"
+        finger_links = ["Fixed_Jaw", "Moving_Jaw", "gripper", "jaw"]
         for agent in [self.left_agent, self.right_agent]:
             for link_name in finger_links:
                 link = agent.robot.links_map.get(link_name)
