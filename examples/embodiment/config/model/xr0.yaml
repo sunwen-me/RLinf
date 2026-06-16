@@ -41,7 +41,7 @@ low_cpu_mem_usage: True
 
 # Action normalization stats: model outputs normalized actions, must denormalize.
 # Extracted from processor.action_config["libero_all"] mean/std.
-stats_path: "./models/Xiaomi-Robotics-0-LIBERO/action_stats.yaml"
+stats_path: "/mnt/ls/Xiaomi-Robotics-0-LIBERO/action_stats.yaml"
 unnorm_key: null
 
 # Flow-matching noise level for RL training (higher = more exploration)

@@ -85,7 +85,7 @@ env:
   group_name: "EnvGroup"
 
   train:
-    total_num_envs: 4  # Must be divisible by group_size
+    total_num_envs: 8  # Must be divisible by group_size * env_world_size
     reward_coef: ${algorithm.reward_coef}
     group_size: ${algorithm.group_size}
     max_episode_steps: 480
@@ -111,19 +111,19 @@ rollout:
   pipeline_stage_num: 1
 
   model:
-    model_path: "./models/Xiaomi-Robotics-0-LIBERO"
+    model_path: "/mnt/ls/Xiaomi-Robotics-0-LIBERO"
     precision: ${actor.model.precision}
 
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
   micro_batch_size: 1
-  global_batch_size: 2
+  global_batch_size: 4
   seed: 42
   enable_offload: True
 
   model:
-    model_path: "./models/Xiaomi-Robotics-0-LIBERO"
+    model_path: "/mnt/ls/Xiaomi-Robotics-0-LIBERO"
 
   optim:
     lr: 5.0e-6

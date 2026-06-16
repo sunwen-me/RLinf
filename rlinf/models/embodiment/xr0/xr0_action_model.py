@@ -952,6 +952,7 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             "prev_logprobs": prev_logprobs,
             "prev_values": prev_values,
             "denoise_inds": torch.full((batch_size,), denoise_ind, dtype=torch.long),
+            "prefix_length": prefix_length,
         }
         if vlm_hidden_states is not None:
             result["vlm_hidden_states"] = vlm_hidden_states.detach()
@@ -1181,7 +1182,7 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         forward_inputs: dict[str, Any] = {
             "chains": outputs["chains"].cpu(),
             "denoise_inds": outputs["denoise_inds"].cpu(),
-            "prefix_length": torch.tensor([prefix_length]),
+            "prefix_length": torch.full((batch_size,), outputs.get("prefix_length", 0), dtype=torch.long),
         }
         for k, v in vlm_batch.items():
             if isinstance(v, torch.Tensor):
@@ -1268,7 +1269,8 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
 
         chains = forward_inputs.get("chains")  # (B, num_steps+1, C, D)
         denoise_inds = forward_inputs.get("denoise_inds")  # (B,)
-        prefix_length = int(forward_inputs.get("prefix_length", torch.tensor([0])).item())
+        _pl = forward_inputs.get("prefix_length", torch.tensor([0]))
+        prefix_length = int(_pl.flatten()[0].item())
 
         def _compute_values(batch_size: int) -> torch.Tensor:
             """Compute values from VLM hidden states if available."""

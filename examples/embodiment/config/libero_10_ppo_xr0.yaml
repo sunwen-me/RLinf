@@ -26,7 +26,7 @@ runner:
     experiment_name: "libero_10_ppo_xr0"
     logger_backends: ["tensorboard"]
 
-  max_epochs: 100
+  max_epochs: 2  # Small test
   max_steps: -1
 
   only_eval: False
@@ -41,7 +41,7 @@ algorithm:
   kl_penalty: kl
   group_size: 1  # PPO doesn't need group_size > 1
   reward_coef: 5.0
-  rollout_epoch: 4
+  rollout_epoch: 1  # Reduced for memory
   eval_rollout_epoch: 1
 
   reward_type: chunk_level
@@ -85,7 +85,7 @@ env:
   group_name: "EnvGroup"
 
   train:
-    total_num_envs: 24
+    total_num_envs: 4
     reward_coef: ${algorithm.reward_coef}
     group_size: ${algorithm.group_size}
     max_episode_steps: 480
@@ -107,23 +107,23 @@ rollout:
   generation_backend: "huggingface"
   recompute_logprobs: False
   unnorm_key: null
-  enable_offload: False
+  enable_offload: True
   pipeline_stage_num: 1
 
   model:
-    model_path: "./models/Xiaomi-Robotics-0-LIBERO"
+    model_path: "/mnt/ls/Xiaomi-Robotics-0-LIBERO"
     precision: ${actor.model.precision}
 
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 16
-  global_batch_size: 64
+  micro_batch_size: 1
+  global_batch_size: 4
   seed: 42
-  enable_offload: False
+  enable_offload: True
 
   model:
-    model_path: "./models/Xiaomi-Robotics-0-LIBERO"
+    model_path: "/mnt/ls/Xiaomi-Robotics-0-LIBERO"
     add_value_head: True  # Enable value head for PPO
 
   optim:
@@ -138,8 +138,8 @@ actor:
 
   fsdp_config:
     strategy: "fsdp"
-    sharding_strategy: "no_shard"
-    gradient_checkpointing: False
+    sharding_strategy: "full_shard"
+    gradient_checkpointing: True
     mixed_precision:
       param_dtype: ${actor.model.precision}
       reduce_dtype: ${actor.model.precision}
