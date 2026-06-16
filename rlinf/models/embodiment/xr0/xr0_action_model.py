@@ -25,6 +25,7 @@ import math
 import os
 import random
 from contextlib import contextmanager
+from types import SimpleNamespace
 from typing import Any, Literal, Optional, Union
 
 import numpy as np
@@ -411,13 +412,13 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         valid_token_count = mask.sum(dim=1).clamp(min=1e-6)
         pooled = sum_hidden / valid_token_count
 
-        # Ensure value_head is on the same device and dtype as input
+        # Ensure value_head is on the same device and dtype as input.
+        # Cache the check to avoid repeated parameter iteration.
         device = pooled.device
         dtype = pooled.dtype
-        if next(self.value_head.parameters()).device != device:
-            self.value_head = self.value_head.to(device)
-        if next(self.value_head.parameters()).dtype != dtype:
-            self.value_head = self.value_head.to(dtype=dtype)
+        vh_param = next(self.value_head.parameters())
+        if vh_param.device != device or vh_param.dtype != dtype:
+            self.value_head = self.value_head.to(device=device, dtype=dtype)
 
         # Value head: (B, D) -> (B, 1) -> (B,)
         values = self.value_head(pooled).squeeze(-1)
@@ -709,7 +710,27 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         # --- Real model: step-by-step denoising ---
         # Use eval mode to disable dropout/BN randomness.  Policy stochasticity
         # comes from Flow-SDE noise, not from dropout.
+        # try/finally ensures train mode is always restored, even on error.
         self.xr0_model.eval()
+        try:
+            return self._sample_actions_real(
+                vlm_batch, state_tensor, device, mode, robot_type, seed,
+            )
+        finally:
+            self.xr0_model.train()
+
+    def _sample_actions_real(
+        self,
+        vlm_batch: dict[str, torch.Tensor],
+        state_tensor: torch.Tensor,
+        device: torch.device,
+        mode: Literal["train", "eval"],
+        robot_type: Optional[str],
+        seed: Optional[int],
+    ) -> dict[str, Any]:
+        """Core denoising loop. Caller must set xr0_model to eval mode."""
+
+        batch_size = state_tensor.shape[0]
 
         # VLM forward to get KV-cache and hidden states.
         # Temporarily disable gradient checkpointing on ALL VLM sub-modules
@@ -790,7 +811,7 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         position_embeds = self.xr0_model.rotary_emb(action_mask, position_ids)
 
         # Attention mask with local causal window for action tokens
-        state_len = state_tensor.shape[1] if state_tensor is not None else 1
+        # Use padded state length (not raw) to match position_ids / dit_query_length.
         s_len = state_len + 1  # +1 for sink token
         a_len = action_len
         mask_ss = torch.tril(torch.ones(s_len, s_len, device=device))
@@ -878,7 +899,7 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         for idx in range(self.num_steps):
             t_val = timesteps[idx]
             if idx == 0:
-                self.logger.info("[DENOISE_DBG] step0 x_t[0,0,:5]=%s attn_mask=%s pos_embeds=%s",
+                self.logger.debug("[DENOISE_DBG] step0 x_t[0,0,:5]=%s attn_mask=%s pos_embeds=%s",
                     x_t[0,0,:5].float().tolist(),
                     tuple(attn_mask.shape),
                     tuple(position_embeds[0].shape))
@@ -892,7 +913,7 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
                 position_embeds, past_key_values, attn_mask,
             )
             if idx == 0:
-                self.logger.info("[DENOISE_DBG] step0 v_t[0,0,:7]=%s max_abs=%.4f",
+                self.logger.debug("[DENOISE_DBG] step0 v_t[0,0,:7]=%s max_abs=%.4f",
                     v_t[0,0,:7].float().tolist(), v_t.float().abs().max().item())
 
             # Compute denoising step with Flow-SDE
@@ -942,9 +963,6 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             )
         else:
             prev_values = torch.zeros(batch_size, device=device)
-
-        # Restore train mode (was set to eval above for dropout-free forward).
-        self.xr0_model.train()
 
         result = {
             "actions": x_t[:, :action_len, : self.action_dim],
@@ -1007,6 +1025,7 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             "denoise_inds": torch.full(
                 (batch_size,), denoise_ind, dtype=torch.long
             ),
+            "prefix_length": 0,
         }
 
     # ------------------------------------------------------------------
@@ -1022,8 +1041,19 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         """
         model = self.xr0_model
 
-        # VLM forward
-        vlm_outputs = model.vlm(**vlm_inputs, use_cache=True)
+        # VLM forward — temporarily disable gradient_checkpointing to avoid
+        # transformers 4.57 forcing use_cache=False when training=True.
+        vlm_module = model.vlm
+        gc_states: list[tuple[torch.nn.Module, bool]] = []
+        for module in vlm_module.modules():
+            if getattr(module, "gradient_checkpointing", False):
+                gc_states.append((module, True))
+                module.gradient_checkpointing = False
+        try:
+            vlm_outputs = vlm_module(**vlm_inputs, use_cache=True)
+        finally:
+            for module, state in gc_states:
+                module.gradient_checkpointing = state
         past_key_values = list(vlm_outputs.past_key_values)
 
         action_bs, action_length, _ = action_mask.shape
@@ -1077,11 +1107,7 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             x = x + v * dt
 
         # Match ActionGenerationOutput interface
-        class _Out:
-            pass
-        out = _Out()
-        out.actions = x
-        return out
+        return SimpleNamespace(actions=x)
 
     @torch.no_grad()
     def predict_action_batch(
@@ -1158,19 +1184,19 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         # ---- Step 2 diagnostic: print raw and decoded action chunk ----
         chunk_raw = raw_actions_cpu[0, :self.num_action_chunks, :7].numpy()
         chunk_7d = actions_np[0, :self.num_action_chunks, :7]
-        self.logger.info(
+        self.logger.debug(
             "[XR0_RAW] max_abs=%.4f first=%s",
             np.max(np.abs(chunk_raw)),
             np.array2string(chunk_raw[0], precision=4, suppress_small=True),
         )
-        self.logger.info(
+        self.logger.debug(
             "[XR0_DECODED] max_abs=%.4f first=%s",
             np.max(np.abs(chunk_7d)),
             np.array2string(chunk_7d[0], precision=4, suppress_small=True),
         )
         if chunk_7d.shape[0] > 1:
             step_diff = np.abs(chunk_7d[1:] - chunk_7d[:-1])
-            self.logger.info(
+            self.logger.debug(
                 "[XR0_STEP_DIFF] max=%s",
                 np.array2string(np.max(step_diff, axis=0), precision=4, suppress_small=True),
             )
@@ -1236,12 +1262,20 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
     # Training-time: forward / default_forward
     # ------------------------------------------------------------------
 
-    def forward(self, **kwargs: Any) -> dict[str, torch.Tensor]:
+    def forward(self, forward_type=None, **kwargs: Any) -> dict[str, torch.Tensor]:
         """Entry point called by the FSDP actor worker.
 
         Delegates to ``default_forward`` so the actor can call
         ``self.model(forward_inputs=..., ...)`` directly.
+
+        Only supports the DEFAULT forward type (RL training).
         """
+        if forward_type is not None:
+            from rlinf.models.embodiment.base_policy import ForwardType
+            if forward_type != ForwardType.DEFAULT:
+                raise NotImplementedError(
+                    f"XR0 does not support forward_type={forward_type}"
+                )
         return self.default_forward(**kwargs)
 
     def default_forward(
@@ -1405,15 +1439,22 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             [cache_mask, causal_mask[None].expand(batch_size, -1, -1)], dim=-1
         )[:, None].bool()
 
-        # Apply prefix masking (must match sample_actions for consistency)
+        # Apply prefix masking (must match sample_actions for consistency).
+        # Seed RNG so the same prefix_length produces the same random mask
+        # as during rollout, avoiding train/test attention pattern mismatch.
         if prefix_length > 2:
-            causal_mask_prefixed = self._random_mask_prefix(
-                causal_mask[None].expand(batch_size, -1, -1),
-                prefix_length, state_len,
-            )
-            attn_mask = torch.cat(
-                [cache_mask, causal_mask_prefixed], dim=-1
-            )[:, None].bool()
+            _rng_state = torch.random.get_rng_state()
+            torch.manual_seed(prefix_length)
+            try:
+                causal_mask_prefixed = self._random_mask_prefix(
+                    causal_mask[None].expand(batch_size, -1, -1),
+                    prefix_length, state_len,
+                )
+                attn_mask = torch.cat(
+                    [cache_mask, causal_mask_prefixed], dim=-1
+                )[:, None].bool()
+            finally:
+                torch.random.set_rng_state(_rng_state)
 
         # Offset position IDs for non-prefix tokens (must match sample_actions)
         if prefix_length > 0 and action_len > prefix_length:
@@ -1491,7 +1532,7 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             mean_diff = (x_t_mean.float() - _dbg_mean.float()).abs()
             std_diff = (x_t_std.float() - _dbg_std.float()).abs()
             normed_mean = mean_diff / _dbg_std.float().clamp_min(1e-6)
-            self.logger.info(
+            self.logger.debug(
                 "[replay debug] v_diff: max=%.6f | mean_diff: max=%.6f | "
                 "std_diff: max=%.6f | mean_diff/sigma: mean=%.6f max=%.6f",
                 v_diff.max().item(), mean_diff.max().item(),
@@ -1519,7 +1560,7 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         # Debug: log logprobs statistics for diagnosing KL issues.
         _lp = logprobs.detach()
         _n_valid = int((_lp != 0).sum().item())
-        self.logger.info(
+        self.logger.debug(
             "[default_forward] logprobs: mean=%.4f, std=%.4f, min=%.4f, max=%.4f, "
             "valid_dims=%d, per_dim_abs_mean=%.6f",
             _lp.mean().item(), _lp.std().item(), _lp.min().item(), _lp.max().item(),
