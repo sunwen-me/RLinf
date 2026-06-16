@@ -19,6 +19,14 @@ precision: "bf16"
 # Policy setup: used by config.py to determine ManiSkill control_mode
 policy_setup: "so101_wristcam"
 
+# robot_type: key for processor.get_action_mask() and processor.decode_action().
+# Determines which action normalization stats are used for denormalization.
+# The LIBERO processor only has "libero_all"; the Pretrain processor has
+# "agibot_pt_v3", "droid_pt", "midata_mix_ann_pt_v1", "molmoact_pt".
+# TODO: register SO101 action stats in the processor, then set this to the
+# correct key.  Without this, decode_action falls back to raw model output.
+# robot_type: "so101_dual"
+
 # Action/chunk settings
 action_dim: 32
 num_action_chunks: 30

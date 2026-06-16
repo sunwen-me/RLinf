@@ -1211,7 +1211,11 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             if isinstance(v, torch.Tensor):
                 forward_inputs[k] = v.detach().cpu()
         forward_inputs["state"] = state_tensor.detach().cpu()
-        # Store full-dim action for training replay (chains are in full dim)
+        # Store decoded action for training replay / DAgger.
+        # NOTE: this is proc.decode_action() output (denormalized), NOT raw
+        # model-space actions.  The framework reads this as "action" or
+        # "model_action" (see huggingface_worker.py expert_forward_inputs).
+        # Shape: (B, num_action_chunks * action_dim) flattened.
         forward_inputs["action"] = torch.from_numpy(
             actions_np.reshape(batch_size, -1).astype(np.float32)
         )

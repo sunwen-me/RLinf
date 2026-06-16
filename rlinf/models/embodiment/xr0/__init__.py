@@ -90,6 +90,12 @@ def get_model(
     noise_method = getattr(cfg, "noise_method", "flow_sde")
     action_env_dim = getattr(cfg, "action_env_dim", None)
 
+    # robot_type: determines which action_mask and decode_action stats to use.
+    # Must match a key in processor.get_action_mask() (e.g. "libero_all",
+    # "so101_dual").  For LIBERO the default "libero_all" is correct.
+    # For SO101, set robot_type: "so101_dual" in the model YAML.
+    robot_type = getattr(cfg, "robot_type", "libero_all")
+
     # XR0-specific config (with defaults matching the original XR0 config)
     xr0_cfg = getattr(cfg, "xr0", cfg)
     local_window = getattr(xr0_cfg, "local_window", 4)
@@ -176,7 +182,10 @@ def get_model(
         async_train=async_train,
         training_repeat=training_repeat,
         freq_coefficient=freq_coefficient,
+        robot_type=robot_type,
     )
+
+    logger.info("XR0 robot_type=%s, action_env_dim=%s", robot_type, action_env_dim)
 
     return policy
 
