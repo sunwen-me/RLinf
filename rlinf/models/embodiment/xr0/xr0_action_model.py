@@ -1124,13 +1124,6 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         device = next(self.parameters()).device
 
         images = env_obs["main_images"]
-        wrist_images = env_obs.get("wrist_images")  # optional
-        # Fallback: ManiSkill puts wrist cameras in extra_view_images (B, V, H, W, C).
-        # Take the first view as the left-wrist image for XR0's two-view prompt.
-        if wrist_images is None:
-            extra_views = env_obs.get("extra_view_images")
-            if extra_views is not None and extra_views.ndim == 5:
-                wrist_images = extra_views[:, 0]  # (B, H, W, C)
         states = env_obs["states"]
         task_descriptions = env_obs.get("task_descriptions") or [""] * len(images)
         batch_size = len(images)
@@ -1144,10 +1137,13 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         if state_tensor.ndim == 2:
             state_tensor = state_tensor.unsqueeze(1)
 
-        # Build VLM batch (with wrist images if available, matching Xiaomi server)
+        # Collect camera views dynamically.
+        # Order matters: must match the <|vision_start|> order in the prompt.
+        camera_views = self._collect_camera_views(env_obs, images)
+
+        # Build VLM batch with dynamic camera views
         vlm_batch = self._build_vlm_batch(
-            images, task_descriptions, state_tensor, device,
-            wrist_images=wrist_images,
+            camera_views, task_descriptions, state_tensor, device,
         )
 
         # Denormalize actions using official processor.decode_action
@@ -1594,25 +1590,88 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
     # Helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _collect_camera_views(
+        env_obs: dict[str, Any],
+        main_images: Union[np.ndarray, torch.Tensor],
+    ) -> list[tuple[str, Union[np.ndarray, torch.Tensor]]]:
+        """Collect (view_name, images) pairs from env observations.
+
+        Dynamically builds the camera view list based on what the environment
+        provides, supporting 1 to N views:
+
+        - ``main_images`` → "Base View" (always present)
+        - ``wrist_images`` → "Left-Wrist View" (LIBERO, SO101)
+        - ``extra_view_images[:, i]`` → "Wrist View {i}" (ManiSkill fallback)
+
+        The view order determines the ``<|vision_start|>`` order in
+        the prompt template.  The processor encodes images in the same
+        flat order.
+
+        Returns:
+            List of ``(view_name, images)`` tuples.  Each ``images``
+            element has shape ``(B, H, W, C)``.
+        """
+        views: list[tuple[str, Union[np.ndarray, torch.Tensor]]] = [
+            ("Base View", main_images),
+        ]
+
+        # Explicit wrist_images (LIBERO produces this directly)
+        wrist_images = env_obs.get("wrist_images")
+        if wrist_images is not None and len(wrist_images) > 0:
+            views.append(("Left-Wrist View", wrist_images))
+        else:
+            # Fallback: ManiSkill puts wrist cameras in extra_view_images
+            # Shape: (B, num_views, H, W, C)
+            extra_views = env_obs.get("extra_view_images")
+            if extra_views is not None and extra_views.ndim == 5:
+                num_extra = extra_views.shape[1]
+                for vi in range(min(num_extra, 3)):  # cap at 3 extra views
+                    label = "Wrist View" if num_extra == 1 else f"Wrist View {vi}"
+                    if vi == 0 and num_extra >= 1:
+                        label = "Left-Wrist View"
+                    elif vi == 1 and num_extra >= 2:
+                        label = "Right-Wrist View"
+                    views.append((label, extra_views[:, vi]))
+
+        return views
+
     def _build_vlm_batch(
         self,
-        images: Union[np.ndarray, torch.Tensor],
+        camera_views: list[tuple[str, Union[np.ndarray, torch.Tensor]]],
         task_descriptions: list[str],
         state_tensor: torch.Tensor,
         device: torch.device,
-        wrist_images: Union[np.ndarray, torch.Tensor, None] = None,
     ) -> dict[str, torch.Tensor]:
         """Convert env observations to Qwen3-VL processor format.
 
+        Supports a variable number of camera views.  The prompt template
+        is built dynamically from the view names:
+
+            <|im_start|>user
+            The following observations are captured from multiple views.
+            # Base View
+            <|vision_start|><|image_pad|><|vision_end|>
+            # Left-Wrist View
+            <|vision_start|><|image_pad|><|vision_end|>
+            # Right-Wrist View            ← only if 3+ views
+            <|vision_start|><|image_pad|><|vision_end|>
+            Generate robot actions for the task: <task> /no_cot
+
         This intentionally mirrors Xiaomi official ``server.py`` instead of
-        using ``apply_chat_template``.  The assistant prefix is the empty COT
-        block used by XR0:
+        using ``apply_chat_template``.
 
-            <|im_start|>assistant
-            <|cot|><|/cot|><|im_end|>
+        Args:
+            camera_views: List of ``(view_name, images)`` tuples from
+                :meth:`_collect_camera_views`.  Each images tensor has
+                shape ``(B, H, W, C)``.
+            task_descriptions: Per-sample task description strings.
+            state_tensor: ``(B, 1, STATE_DIM)`` state (unused here but
+                kept for interface consistency).
+            device: Target device.
 
-        ``/no_cot`` is a user-side suffix, not text for the assistant to
-        generate.
+        Returns:
+            Dict of processor output tensors on *device*.
         """
         def _to_pil(img):
             if isinstance(img, torch.Tensor):
@@ -1621,35 +1680,33 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
                 img_np = img
             return Image.fromarray(img_np.astype(np.uint8)).convert("RGB")
 
-        if wrist_images is None or len(wrist_images) == 0:
-            raise ValueError(
-                "XR0 Xiaomi non-bridge/fractal prompt requires wrist_images "
-                "because the official prompt contains both Base View and "
-                "Left-Wrist View image pads."
-            )
+        if len(camera_views) == 0:
+            raise ValueError("camera_views must have at least one view (Base View)")
 
+        # Build the image block for the prompt dynamically.
+        image_block = ""
+        for view_name, _ in camera_views:
+            image_block += f"# {view_name}\n<|vision_start|><|image_pad|><|vision_end|>\n"
+
+        batch_size = len(camera_views[0][1])
         texts: list[str] = []
         processor_images = []
 
-        for i in range(len(images)):
+        for i in range(batch_size):
             lang = task_descriptions[i] if i < len(task_descriptions) else ""
             instruction = (
                 "<|im_start|>user\n"
                 "The following observations are captured from multiple views.\n"
-                "# Base View\n"
-                "<|vision_start|><|image_pad|><|vision_end|>\n"
-                "# Left-Wrist View\n"
-                "<|vision_start|><|image_pad|><|vision_end|>\n"
-                "Generate robot actions for the task:\n"
+                + image_block
+                + "Generate robot actions for the task:\n"
                 + lang.rstrip(".")
                 + " /no_cot"
             )
             texts.append(instruction)
 
-            # Flat image order must match the image_pad order in every text:
-            # base_i first, then wrist_left_i.
-            processor_images.append(_to_pil(images[i]))
-            processor_images.append(_to_pil(wrist_images[i]))
+            # Flat image order must match the <|vision_start|> order.
+            for _, view_images in camera_views:
+                processor_images.append(_to_pil(view_images[i]))
 
         inputs = self.processor(
             text=texts,
@@ -1663,6 +1720,7 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             k: v.to(device) for k, v in inputs.items() if isinstance(v, torch.Tensor)
         }
         return batch
+
 
     # ------------------------------------------------------------------
     # Gradient checkpointing
