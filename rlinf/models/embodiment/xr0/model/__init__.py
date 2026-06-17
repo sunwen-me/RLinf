@@ -14,6 +14,7 @@
 
 """Vendored XR0 model components from Xiaomi-Robotics-0.
 
-Imports are lazy — ``xr0_model`` and ``qwen3vl`` depend on ``transformers``,
-which is only needed when the full model is built (not for stub/dummy mode).
+Only ``modeling_mibot.py`` and ``configuration_mibot.py`` are kept — they
+provide ``MiBoTForActionGeneration`` used by ``get_model()``.  The original
+``xr0_model.py`` and ``qwen3vl.py`` were removed as dead code (never imported).
 """
