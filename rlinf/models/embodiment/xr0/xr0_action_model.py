@@ -145,6 +145,9 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         self.training_repeat = training_repeat
         self.freq_coefficient = freq_coefficient
         self.prefix_mask_prob = 0.5
+        # Debug switch: set XR0_DEBUG=1 to enable debug logs and tensors.
+        # Disabled by default to avoid CPU tensor copies and log spam.
+        self._debug = os.environ.get("XR0_DEBUG", "0") == "1"
 
         # Action mapper: handles 32D <-> env_dim conversion with valid_action_mask.
         # Takes precedence over action_env_dim (simple slicing).
@@ -941,10 +944,11 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         debug_v_t = None
         debug_x_t_mean = None
         debug_x_t_std = None
+        _dbg = self._debug
 
         for idx in range(self.num_steps):
             t_val = timesteps[idx]
-            if idx == 0 and batch_size > 0:
+            if _dbg and idx == 0 and batch_size > 0:
                 self.logger.debug("[DENOISE_DBG] step0 x_t[0,0,:5]=%s attn_mask=%s pos_embeds=%s",
                     x_t[0,0,:5].float().tolist(),
                     tuple(attn_mask.shape),
@@ -963,7 +967,7 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             if prefix_length > 0:
                 v_t[:, :prefix_length] = 0.0
 
-            if idx == 0:
+            if _dbg and idx == 0:
                 self.logger.debug("[DENOISE_DBG] step0 v_t[0,0,:7]=%s max_abs=%.4f",
                     v_t[0,0,:7].float().tolist(), v_t.float().abs().max().item())
 
@@ -974,7 +978,7 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             )
 
             # Save debug values at the chosen denoise step.
-            if idx == denoise_ind and denoise_ind >= 0:
+            if _dbg and idx == denoise_ind and denoise_ind >= 0:
                 debug_v_t = v_t.detach().float().cpu()
                 mean_dbg, std_dbg = self._compute_denoise_mean_std(
                     chains[-1], v_t, timesteps, idx, mode="train"
@@ -1028,8 +1032,8 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             result["vlm_attention_mask"] = vlm_attention_mask.detach()
         result["vlm_pos_max"] = packed_pos_max
         result.update(packed_kv)
-        # Debug tensors for replay comparison.
-        if debug_v_t is not None:
+        # Debug tensors for replay comparison (only when XR0_DEBUG=1).
+        if _dbg and debug_v_t is not None:
             result["debug_v_t"] = debug_v_t
             result["debug_x_t_mean"] = debug_x_t_mean
             result["debug_x_t_std"] = debug_x_t_std
@@ -1259,24 +1263,25 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         actions_np = decoded.numpy()[:, :self.num_action_chunks, :]
 
         # ---- Step 2 diagnostic: print raw and decoded action chunk ----
-        chunk_raw = raw_actions_cpu[0, :self.num_action_chunks, :7].numpy()
-        chunk_7d = actions_np[0, :self.num_action_chunks, :7]
-        self.logger.debug(
-            "[XR0_RAW] max_abs=%.4f first=%s",
-            np.max(np.abs(chunk_raw)),
-            np.array2string(chunk_raw[0], precision=4, suppress_small=True),
-        )
-        self.logger.debug(
-            "[XR0_DECODED] max_abs=%.4f first=%s",
-            np.max(np.abs(chunk_7d)),
-            np.array2string(chunk_7d[0], precision=4, suppress_small=True),
-        )
-        if chunk_7d.shape[0] > 1:
-            step_diff = np.abs(chunk_7d[1:] - chunk_7d[:-1])
+        if self._debug:
+            chunk_raw = raw_actions_cpu[0, :self.num_action_chunks, :7].numpy()
+            chunk_7d = actions_np[0, :self.num_action_chunks, :7]
             self.logger.debug(
-                "[XR0_STEP_DIFF] max=%s",
-                np.array2string(np.max(step_diff, axis=0), precision=4, suppress_small=True),
+                "[XR0_RAW] max_abs=%.4f first=%s",
+                np.max(np.abs(chunk_raw)),
+                np.array2string(chunk_raw[0], precision=4, suppress_small=True),
             )
+            self.logger.debug(
+                "[XR0_DECODED] max_abs=%.4f first=%s",
+                np.max(np.abs(chunk_7d)),
+                np.array2string(chunk_7d[0], precision=4, suppress_small=True),
+            )
+            if chunk_7d.shape[0] > 1:
+                step_diff = np.abs(chunk_7d[1:] - chunk_7d[:-1])
+                self.logger.debug(
+                    "[XR0_STEP_DIFF] max=%s",
+                    np.array2string(np.max(step_diff, axis=0), precision=4, suppress_small=True),
+                )
 
         # Build forward_inputs for training replay
         # NOTE: robot_type is NOT stored here because forward_inputs must
@@ -1310,10 +1315,11 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
                     forward_inputs[k] = v.cpu()
                 else:
                     forward_inputs[k] = v
-        # Store debug tensors for replay comparison.
-        for k in ("debug_v_t", "debug_x_t_mean", "debug_x_t_std"):
-            if k in outputs:
-                forward_inputs[k] = outputs[k]
+        # Store debug tensors for replay comparison (only when XR0_DEBUG=1).
+        if self._debug:
+            for k in ("debug_v_t", "debug_x_t_mean", "debug_x_t_std"):
+                if k in outputs:
+                    forward_inputs[k] = outputs[k]
 
         # Slice/gather actions to environment's expected dimension.
         # XR0 outputs 32D (bimanual) but e.g. LIBERO expects 7D (right arm),
@@ -1596,23 +1602,24 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         )
 
         # Debug: compare rollout vs training v_t / mean / std.
-        _dbg_v = forward_inputs.get("debug_v_t")
-        _dbg_mean = forward_inputs.get("debug_x_t_mean")
-        _dbg_std = forward_inputs.get("debug_x_t_std")
-        if _dbg_v is not None and _dbg_mean is not None and _dbg_std is not None:
-            _dbg_v = _dbg_v.to(device=device, dtype=v_t.dtype)
-            _dbg_mean = _dbg_mean.to(device=device, dtype=x_t_mean.dtype)
-            _dbg_std = _dbg_std.to(device=device, dtype=x_t_std.dtype)
-            v_diff = (v_t.float() - _dbg_v.float()).abs()
-            mean_diff = (x_t_mean.float() - _dbg_mean.float()).abs()
-            std_diff = (x_t_std.float() - _dbg_std.float()).abs()
-            normed_mean = mean_diff / _dbg_std.float().clamp_min(1e-6)
-            self.logger.debug(
-                "[replay debug] v_diff: max=%.6f | mean_diff: max=%.6f | "
-                "std_diff: max=%.6f | mean_diff/sigma: mean=%.6f max=%.6f",
-                v_diff.max().item(), mean_diff.max().item(),
-                std_diff.max().item(), normed_mean.mean().item(), normed_mean.max().item(),
-            )
+        if self._debug:
+            _dbg_v = forward_inputs.get("debug_v_t")
+            _dbg_mean = forward_inputs.get("debug_x_t_mean")
+            _dbg_std = forward_inputs.get("debug_x_t_std")
+            if _dbg_v is not None and _dbg_mean is not None and _dbg_std is not None:
+                _dbg_v = _dbg_v.to(device=device, dtype=v_t.dtype)
+                _dbg_mean = _dbg_mean.to(device=device, dtype=x_t_mean.dtype)
+                _dbg_std = _dbg_std.to(device=device, dtype=x_t_std.dtype)
+                v_diff = (v_t.float() - _dbg_v.float()).abs()
+                mean_diff = (x_t_mean.float() - _dbg_mean.float()).abs()
+                std_diff = (x_t_std.float() - _dbg_std.float()).abs()
+                normed_mean = mean_diff / _dbg_std.float().clamp_min(1e-6)
+                self.logger.debug(
+                    "[replay debug] v_diff: max=%.6f | mean_diff: max=%.6f | "
+                    "std_diff: max=%.6f | mean_diff/sigma: mean=%.6f max=%.6f",
+                    v_diff.max().item(), mean_diff.max().item(),
+                    std_diff.max().item(), normed_mean.mean().item(), normed_mean.max().item(),
+                )
 
         # Log-prob of recorded next state under current policy.
         # Return shape (B, num_action_chunks, action_dim) so that
@@ -1642,15 +1649,16 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             action_valid_mask = torch.ones_like(logprobs)
 
         # Debug: log logprobs statistics for diagnosing KL issues.
-        _lp = logprobs.detach()
-        _n_valid = int((_lp != 0).sum().item())
-        self.logger.debug(
-            "[default_forward] logprobs: mean=%.4f, std=%.4f, min=%.4f, max=%.4f, "
-            "valid_dims=%d, per_dim_abs_mean=%.6f",
-            _lp.mean().item(), _lp.std().item(), _lp.min().item(), _lp.max().item(),
-            _n_valid,
-            _lp.abs().sum().item() / max(_n_valid, 1),
-        )
+        if self._debug:
+            _lp = logprobs.detach()
+            _n_valid = int((_lp != 0).sum().item())
+            self.logger.debug(
+                "[default_forward] logprobs: mean=%.4f, std=%.4f, min=%.4f, max=%.4f, "
+                "valid_dims=%d, per_dim_abs_mean=%.6f",
+                _lp.mean().item(), _lp.std().item(), _lp.min().item(), _lp.max().item(),
+                _n_valid,
+                _lp.abs().sum().item() / max(_n_valid, 1),
+            )
 
         # Values from VLM hidden states (or stub zeros)
         if self.add_value_head and "vlm_hidden_states" in forward_inputs:
