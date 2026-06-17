@@ -1616,9 +1616,18 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         # logprob aggregation (sum over action_dim) and entropy computation
         # only use the dimensions that the environment actually consumes.
         # This prevents e.g. XR0's 20 unused dims from polluting the loss.
+        # Also build action_valid_mask (B, C, D) for the loss function to
+        # combine with response_mask, so invalid action dims are excluded
+        # from masked_mean aggregation.
         if self.action_mapper is not None:
             logprobs = self.action_mapper.apply_mask(logprobs)
             entropy = self.action_mapper.apply_mask(entropy)
+            # (action_dim,) → (1, 1, D) for broadcast with (B, C, D)
+            action_valid_mask = self.action_mapper.valid_action_mask.to(
+                device=logprobs.device, dtype=logprobs.dtype,
+            ).view(1, 1, -1).expand_as(logprobs)
+        else:
+            action_valid_mask = torch.ones_like(logprobs)
 
         # Debug: log logprobs statistics for diagnosing KL issues.
         _lp = logprobs.detach()
@@ -1643,6 +1652,7 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             "logprobs": logprobs.float(),
             "values": values.float(),
             "entropy": entropy.float(),
+            "action_valid_mask": action_valid_mask.float(),
         }
 
     # ------------------------------------------------------------------

@@ -48,7 +48,7 @@ algorithm:
   logprob_type: chunk_level
   entropy_type: token_level
 
-  update_epoch: 4  # PPO typically uses multiple update epochs
+  update_epoch: 1  # Reduced for memory on 24GB GPUs
   adv_type: gae    # GAE for PPO (not grpo)
   loss_type: actor_critic  # PPO actor + critic loss (not actor-only)
   loss_agg_func: "token-mean"

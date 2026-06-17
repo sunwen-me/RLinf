@@ -373,8 +373,10 @@ def compute_ppo_critic_loss(
 
     # explained variance
     if loss_mask is not None:
-        masked_returns = returns[loss_mask]
-        masked_values = values[loss_mask]
+        # Flatten mask to 1D for boolean indexing on (B,) or (B, 1) tensors.
+        flat_mask = loss_mask.bool().reshape(-1)
+        masked_returns = returns.reshape(-1)[flat_mask]
+        masked_values = values.reshape(-1)[flat_mask]
     else:
         masked_returns = returns
         masked_values = values
@@ -433,7 +435,13 @@ def compute_ppo_actor_critic_loss(**kwargs) -> tuple[torch.Tensor, dict]:
     """
     metrics_data = {}
     actor_loss, actor_metrics_data = compute_ppo_actor_loss(**kwargs)
-    critic_loss, critic_metrics_data = compute_ppo_critic_loss(**kwargs)
+    # Critic uses 2D mask (B, C) for per-timestep values/returns.
+    # If caller provides critic_loss_mask (e.g. XR0 with 3D action mask),
+    # use it; otherwise fall back to the same loss_mask as actor.
+    critic_kwargs = {**kwargs}
+    if "critic_loss_mask" in critic_kwargs:
+        critic_kwargs["loss_mask"] = critic_kwargs.pop("critic_loss_mask")
+    critic_loss, critic_metrics_data = compute_ppo_critic_loss(**critic_kwargs)
 
     loss = actor_loss + critic_loss
     metrics_data.update(actor_metrics_data)

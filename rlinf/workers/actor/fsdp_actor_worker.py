@@ -1437,6 +1437,23 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     ):
                         prev_logprobs = output_dict["prev_logprobs"]
 
+                    # Combine response_mask (B, C) with action_valid_mask (B, C, D)
+                    # so that invalid action dimensions are excluded from
+                    # actor policy loss.  Critic loss still uses the original
+                    # 2D loss_mask since values/returns are per-sample, not
+                    # per-action-dimension.
+                    actor_loss_mask = loss_mask
+                    action_valid_mask = output_dict.get("action_valid_mask")
+                    if action_valid_mask is not None:
+                        # loss_mask: (B, C) → (B, C, 1), action_valid_mask: (B, C, D)
+                        actor_loss_mask = (
+                            loss_mask.unsqueeze(-1) * action_valid_mask
+                        ).bool()
+                    # Critic loss_mask must match returns/values shape.
+                    # returns is (B,) or (B, 1), loss_mask is (B, C).
+                    # Use any(dim=1) to collapse to (B,) for boolean indexing.
+                    critic_loss_mask_2d = loss_mask.any(dim=-1) if loss_mask.ndim > 1 else loss_mask
+
                     kwargs = {
                         "loss_type": self.cfg.algorithm.loss_type,
                         "logprob_type": self.cfg.algorithm.logprob_type,
@@ -1452,7 +1469,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         "clip_ratio_low": self.cfg.algorithm.clip_ratio_low,
                         "value_clip": self.cfg.algorithm.get("value_clip", None),
                         "huber_delta": self.cfg.algorithm.get("huber_delta", None),
-                        "loss_mask": loss_mask,
+                        "loss_mask": actor_loss_mask,
+                        "critic_loss_mask": critic_loss_mask_2d,  # (B,) for critic
                         "loss_mask_sum": loss_mask_sum,
                         "max_episode_steps": self.cfg.env.train.max_episode_steps,
                         "task_type": self.cfg.runner.task_type,
@@ -1475,7 +1493,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                             action_dim=self.cfg.actor.model.get("action_dim", 7),
                             batch_size=output_dict["logprobs"].shape[0],
                         )
-                        entropy_loss = masked_mean(entropy, mask=loss_mask)
+                        entropy_loss = masked_mean(entropy, mask=actor_loss_mask)
                         loss -= self.cfg.algorithm.entropy_bonus * entropy_loss
                     metrics_data["actor/entropy_loss"] = entropy_loss.detach().item()
 
