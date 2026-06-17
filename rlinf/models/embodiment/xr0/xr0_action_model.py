@@ -104,6 +104,7 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         self.logger = get_logger()
 
         self.xr0_model = xr0_model
+        self._is_stub = hasattr(xr0_model, "generate")  # _StubXR0 detection
         self.action_dim = int(action_dim)
         self.num_action_chunks = int(num_action_chunks)
         self.num_steps = int(num_steps)
@@ -1101,13 +1102,15 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         state_embed = model.state_projector(state)
 
         # Denoising loop with seed
-        cpu_rng = torch.get_rng_state()
-        gpu_rng = torch.cuda.get_rng_state(action_mask.device) if action_mask.is_cuda else None
-        torch.manual_seed(seed)
+        if seed is not None:
+            cpu_rng = torch.get_rng_state()
+            gpu_rng = torch.cuda.get_rng_state(action_mask.device) if action_mask.is_cuda else None
+            torch.manual_seed(seed)
         x = torch.randn_like(action_mask)
-        torch.set_rng_state(cpu_rng)
-        if gpu_rng is not None:
-            torch.cuda.set_rng_state(gpu_rng, action_mask.device)
+        if seed is not None:
+            torch.set_rng_state(cpu_rng)
+            if gpu_rng is not None:
+                torch.cuda.set_rng_state(gpu_rng, action_mask.device)
 
         dt = 1.0 / self.num_steps
         for step in range(self.num_steps):
@@ -1160,9 +1163,24 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         if state_tensor.ndim == 2:
             state_tensor = state_tensor.unsqueeze(1)
 
+        # Stub fast path: skip processor, VLM batch, and decode_action.
+        # This allows CI / smoke tests to run without network or real weights.
+        if self._is_stub:
+            actions = torch.randn(
+                (batch_size, self.num_action_chunks, self.action_dim),
+                device=device, dtype=torch.bfloat16,
+            ).cpu().numpy()
+            env_actions_np = actions[:, :, : self.action_env_dim]
+            result = {
+                "prev_logprobs": torch.zeros(batch_size, self.num_action_chunks, self.action_dim),
+                "prev_values": torch.zeros(batch_size),
+                "forward_inputs": {},
+            }
+            return env_actions_np, result
+
         # Collect camera views dynamically.
         # Order matters: must match the <|vision_start|> order in the prompt.
-        camera_views = self._collect_camera_views(env_obs, images)
+        camera_views = self._collect_camera_views(env_obs, images, logger=self.logger)
 
         # Build VLM batch with dynamic camera views
         vlm_batch = self._build_vlm_batch(
@@ -1339,6 +1357,19 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         denoise_inds = forward_inputs.get("denoise_inds")  # (B,)
         _pl = forward_inputs.get("prefix_length", torch.tensor([0]))
         prefix_length = int(_pl.flatten()[0].item())
+
+        # Assert batch-global consistency: sample_actions() generates one
+        # denoise_ind and prefix_length per batch, so all samples in a
+        # micro-batch must agree.  If RLinf's cat/split ever mixes samples
+        # from different rollout calls, these assertions will catch it.
+        if denoise_inds is not None and denoise_inds.numel() > 1:
+            assert torch.all(denoise_inds == denoise_inds[0]), (
+                f"denoise_inds vary within micro-batch: {denoise_inds.tolist()}"
+            )
+        if _pl.numel() > 1:
+            assert torch.all(_pl == _pl[0]), (
+                f"prefix_length varies within micro-batch: {_pl.tolist()}"
+            )
 
         def _compute_values(batch_size: int) -> torch.Tensor:
             """Compute values from VLM hidden states if available."""
@@ -1621,10 +1652,16 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
     # Helpers
     # ------------------------------------------------------------------
 
+    # Maximum number of camera views (including base).  Configurable via
+    # xr0.max_camera_views in the model YAML.  Views beyond this limit
+    # are silently dropped with a warning.
+    MAX_CAMERA_VIEWS = 4
+
     @staticmethod
     def _collect_camera_views(
         env_obs: dict[str, Any],
         main_images: Union[np.ndarray, torch.Tensor],
+        logger=None,
     ) -> list[tuple[str, Union[np.ndarray, torch.Tensor]]]:
         """Collect (view_name, images) pairs from env observations.
 
@@ -1654,7 +1691,15 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             if ndim == 5:
                 # (B, num_views, H, W, C) — split into individual views
                 num_views = wrist_images.shape[1]
-                for vi in range(min(num_views, 3)):
+                max_extra = XR0ForRLActionPrediction.MAX_CAMERA_VIEWS - 1  # -1 for base
+                if num_views > max_extra and logger is not None:
+                    logger.warning(
+                        "wrist_images has %d views but MAX_CAMERA_VIEWS=%d; "
+                        "dropping views %d..%d",
+                        num_views, XR0ForRLActionPrediction.MAX_CAMERA_VIEWS,
+                        max_extra, num_views - 1,
+                    )
+                for vi in range(min(num_views, max_extra)):
                     label = "Left-Wrist View" if vi == 0 else (
                         "Right-Wrist View" if vi == 1 else f"Wrist View {vi}"
                     )
@@ -1668,7 +1713,15 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             extra_views = env_obs.get("extra_view_images")
             if extra_views is not None and extra_views.ndim == 5:
                 num_extra = extra_views.shape[1]
-                for vi in range(min(num_extra, 3)):  # cap at 3 extra views
+                max_extra = XR0ForRLActionPrediction.MAX_CAMERA_VIEWS - 1
+                if num_extra > max_extra and logger is not None:
+                    logger.warning(
+                        "extra_view_images has %d views but MAX_CAMERA_VIEWS=%d; "
+                        "dropping views %d..%d",
+                        num_extra, XR0ForRLActionPrediction.MAX_CAMERA_VIEWS,
+                        max_extra, num_extra - 1,
+                    )
+                for vi in range(min(num_extra, max_extra)):
                     label = "Wrist View" if num_extra == 1 else f"Wrist View {vi}"
                     if vi == 0 and num_extra >= 1:
                         label = "Left-Wrist View"

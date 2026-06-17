@@ -164,6 +164,18 @@ def get_model(
         xr0_cfg, "train_expert_only", False
     )
 
+    # Validate: current implementation uses cached VLM KV from rollout in
+    # default_forward().  This means VLM gradients are NOT computed during
+    # training, so train_expert_only must be True.  If VLM training is
+    # needed, default_forward() must re-run VLM forward with gradients.
+    if not train_expert_only and model_path != "dummy":
+        logger.warning(
+            "train_expert_only=False but XR0's default_forward uses cached "
+            "VLM KV (no VLM gradients). Setting train_expert_only=True. "
+            "To train VLM, modify default_forward to re-run VLM forward."
+        )
+        train_expert_only = True
+
     policy = XR0ForRLActionPrediction(
         xr0_model=xr0_model,
         action_dim=action_dim,
