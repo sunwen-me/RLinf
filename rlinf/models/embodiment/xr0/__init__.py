@@ -39,6 +39,10 @@ class _StubXR0(nn.Module):
     network access or large model downloads.
     """
 
+    # Explicit stub marker.  Real XR0 models (MiBoTForActionGeneration)
+    # may also expose generate(), so we cannot rely on hasattr(xr0, "generate").
+    _rlinf_is_stub_xr0 = True
+
     def __init__(self, action_shape=(30, 32), num_steps=5):
         super().__init__()
         self.action_shape = action_shape

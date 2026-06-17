@@ -110,3 +110,45 @@ def test_xr0_default_forward_returns_stub():
     assert result["logprobs"].shape == (1, 30, 32)
     assert result["values"].shape == (1,)
     assert result["entropy"].shape == (1, 30, 32)
+
+
+def test_xr0_real_model_with_generate_not_stub():
+    """Verify a model that has generate() is NOT treated as stub.
+
+    Real XR0 models (MiBoTForActionGeneration) inherit from
+    PreTrainedModel which exposes generate().  The old hasattr check
+    would incorrectly treat them as stubs, bypassing VLM/DiT inference.
+    Only models with the explicit _rlinf_is_stub_xr0 marker should be stubs.
+    """
+    import torch.nn as nn
+
+    from rlinf.models.embodiment.xr0 import _StubXR0
+    from rlinf.models.embodiment.xr0.xr0_action_model import XR0ForRLActionPrediction
+
+    # Model with generate() but no stub marker — should NOT be stub
+    class FakeRealModel(nn.Module):
+        def generate(self, **kwargs):
+            raise NotImplementedError("This is a real model, not a stub")
+
+    fake_model = FakeRealModel()
+    policy = XR0ForRLActionPrediction(
+        xr0_model=fake_model,
+        action_dim=32,
+        num_action_chunks=10,
+        num_steps=5,
+    )
+    assert policy._is_stub is False, (
+        "Real model with generate() should not be detected as stub"
+    )
+
+    # Explicit stub model — should be stub
+    stub_model = _StubXR0()
+    policy_stub = XR0ForRLActionPrediction(
+        xr0_model=stub_model,
+        action_dim=32,
+        num_action_chunks=10,
+        num_steps=5,
+    )
+    assert policy_stub._is_stub is True, (
+        "_StubXR0 should be detected as stub"
+    )

@@ -104,7 +104,9 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         self.logger = get_logger()
 
         self.xr0_model = xr0_model
-        self._is_stub = hasattr(xr0_model, "generate")  # _StubXR0 detection
+        # Detect stub via explicit marker, NOT hasattr(xr0_model, "generate").
+        # Real XR0 models (MiBoTForActionGeneration) also have generate().
+        self._is_stub = getattr(xr0_model, "_rlinf_is_stub_xr0", False)
         self.action_dim = int(action_dim)
         self.num_action_chunks = int(num_action_chunks)
         self.num_steps = int(num_steps)
@@ -699,10 +701,7 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         """
         batch_size = state_tensor.shape[0]
 
-        # Determine if stub or real model
-        is_stub = hasattr(self.xr0_model, "generate")
-
-        if is_stub:
+        if self._is_stub:
             return self._sample_actions_stub(
                 batch_size, device, mode
             )
@@ -1404,9 +1403,7 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
                 "entropy": torch.zeros(batch_size, self.num_action_chunks, self.action_dim, device=device),
             }
 
-        is_stub = hasattr(self.xr0_model, "generate")
-
-        if is_stub:
+        if self._is_stub:
             # For stub model, return dummy logprobs/entropy with correct shape.
             # Compute values from VLM hidden states if available.
             if self.add_value_head and "vlm_hidden_states" in forward_inputs:
@@ -1460,8 +1457,8 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
                 past_key_values = list(vlm_outputs.past_key_values)
                 vlm_pos_max = vlm_outputs.position_ids.max(dim=-1)[0]
             finally:
-                for module, state in gc_states:
-                    module.gradient_checkpointing = state
+                for module, gc_state in gc_states:
+                    module.gradient_checkpointing = gc_state
 
         # Reconstruct attention mask from stored forward_inputs.
         fi_attn_mask = forward_inputs.get("attention_mask")
