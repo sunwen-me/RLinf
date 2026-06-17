@@ -1004,6 +1004,7 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
                 batch_size, action_len, self.action_dim, device=device
             )
 
+
         # Apply valid_action_mask to prev_logprobs so that stored old_logprobs
         # are consistent with the masked logprobs in default_forward.
         # This ensures the PPO ratio exp(logprobs - old_logprobs) only sees
@@ -1625,6 +1626,7 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         # Return shape (B, num_action_chunks, action_dim) so that
         # preprocess_loss_inputs can reshape/aggregate as needed.
         logprobs = self.get_logprob_norm(x_next, x_t_mean, x_t_std)
+
         # logprobs: (B, C, D) — keep all dims for the loss function.
 
         # Entropy: same shape as logprobs.
