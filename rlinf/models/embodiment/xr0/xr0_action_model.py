@@ -941,10 +941,6 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
                 torch.cuda.set_rng_state(gpu_rng_state, device)
         chains = [x_t.detach().clone()]
         log_probs = []
-        # Debug: store v_t / mean / std at the chosen denoise step.
-        debug_v_t = None
-        debug_x_t_mean = None
-        debug_x_t_std = None
         _dbg = self._debug
 
         for idx in range(self.num_steps):
@@ -977,16 +973,6 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             x_t_next, x_t_std_step, log_prob = self._compute_denoise_step(
                 x_t, v_t, timesteps, idx, mode=step_mode
             )
-
-            # Save debug values at the chosen denoise step.
-            # Always store when async prefix is active for replay comparison.
-            if idx == denoise_ind and denoise_ind >= 0:
-                debug_v_t = v_t.detach().float().cpu()
-                mean_dbg, std_dbg = self._compute_denoise_mean_std(
-                    chains[-1], v_t, timesteps, idx, mode="train"
-                )
-                debug_x_t_mean = mean_dbg.detach().float().cpu()
-                debug_x_t_std = std_dbg.detach().float().cpu()
 
             x_t = x_t_next
             chains.append(x_t.detach().clone())
@@ -1043,13 +1029,6 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             result["rope_sin"] = position_embeds[1].detach().cpu()
         else:
             result["rope_embeds"] = position_embeds.detach().cpu()
-        # Debug tensors for replay comparison.
-        # Always store when async prefix is active, regardless of XR0_DEBUG,
-        # so that default_forward can compare rollout vs replay v_t / mean / std.
-        if debug_v_t is not None:
-            result["debug_v_t"] = debug_v_t
-            result["debug_x_t_mean"] = debug_x_t_mean
-            result["debug_x_t_std"] = debug_x_t_std
         return result
 
     def _sample_actions_stub(
@@ -1325,16 +1304,11 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         # training replay.  rope_cos/sin must be stored because
         # Qwen3VLTextRotaryEmbedding is batch-size sensitive (internal cache).
         for k, v in outputs.items():
-            if k.startswith("vlm_kv_") or k in ("vlm_pos_max", "rope_cos", "rope_sin"):
+            if k.startswith("vlm_kv_") or k in ("vlm_pos_max", "rope_cos", "rope_sin", "rope_embeds"):
                 if isinstance(v, torch.Tensor):
                     forward_inputs[k] = v.cpu()
                 else:
                     forward_inputs[k] = v
-        # Store debug tensors for replay comparison (only when XR0_DEBUG=1).
-        if self._debug:
-            for k in ("debug_v_t", "debug_x_t_mean", "debug_x_t_std"):
-                if k in outputs:
-                    forward_inputs[k] = outputs[k]
 
         # Slice/gather actions to environment's expected dimension.
         # XR0 outputs 32D (bimanual) but e.g. LIBERO expects 7D (right arm),
@@ -1553,10 +1527,6 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
                     [cache_mask, causal_mask_prefixed], dim=-1
                 )[:, None].bool()
 
-        # Offset position IDs for non-prefix tokens (must match sample_actions)
-        if prefix_length > 0 and action_len > prefix_length:
-            position_ids[:, :, -(action_len - prefix_length):] += 10
-
         # State embedding (pad/truncate to match model's expected dim)
         state_tensor_padded = self._pad_state(state_tensor)
         state_embed = self.xr0_model.state_projector(
@@ -1568,6 +1538,9 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
 
         # Use stored position_embeds from rollout to avoid batch-size
         # sensitivity in Qwen3VLTextRotaryEmbedding's internal cache.
+        # IMPORTANT: compute BEFORE applying position offset, matching
+        # the order in sample_actions (rotary_emb at line 869, offset at
+        # line 898).  The fallback recomputation must also be before offset.
         _rope_cos = forward_inputs.get("rope_cos")
         _rope_sin = forward_inputs.get("rope_sin")
         if _rope_cos is not None and _rope_sin is not None:
@@ -1578,6 +1551,11 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         else:
             # Fallback: recompute (may differ from rollout if batch size differs)
             position_embeds = self.xr0_model.rotary_emb(action_mask, position_ids)
+
+        # Offset position IDs for non-prefix tokens (must match sample_actions).
+        # Applied AFTER rotary_emb to match rollout order.
+        if prefix_length > 0 and action_len > prefix_length:
+            position_ids[:, :, -(action_len - prefix_length):] += 10
 
         timesteps = torch.linspace(
             1.0, 0.0, self.num_steps + 1, device=device
@@ -1621,20 +1599,6 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         x_t_mean, x_t_std = self._compute_denoise_mean_std(
             x_t, v_t, timesteps, denoise_ind, mode="train"
         )
-
-        # Debug: compare rollout vs training v_t / mean / std.
-        # Always compare when debug tensors are available (async prefix mode).
-        _dbg_v = forward_inputs.get("debug_v_t")
-        _dbg_mean = forward_inputs.get("debug_x_t_mean")
-        _dbg_std = forward_inputs.get("debug_x_t_std")
-        if _dbg_v is not None and _dbg_mean is not None and _dbg_std is not None:
-            _dbg_v = _dbg_v.to(device=device, dtype=v_t.dtype)
-            _dbg_mean = _dbg_mean.to(device=device, dtype=x_t_mean.dtype)
-            _dbg_std = _dbg_std.to(device=device, dtype=x_t_std.dtype)
-            v_diff = (v_t.float() - _dbg_v.float()).abs()
-            mean_diff = (x_t_mean.float() - _dbg_mean.float()).abs()
-            std_diff = (x_t_std.float() - _dbg_std.float()).abs()
-            normed_mean = mean_diff / _dbg_std.float().clamp_min(1e-6)
 
         # Log-prob of recorded next state under current policy.
         # Return shape (B, num_action_chunks, action_dim) so that
