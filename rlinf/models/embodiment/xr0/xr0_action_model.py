@@ -471,6 +471,41 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             # Truncate
             return state[..., :expected_dim]
 
+    def _build_causal_mask(
+        self,
+        state_len: int,
+        action_len: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Build causal attention mask with local window for action tokens.
+
+        The mask has 4 quadrants::
+
+            ┌─────────┬─────────┐
+            │  state  │  zeros  │  state tokens attend to each other
+            │  (tril) │         │  (causal), not to action tokens
+            ├─────────┼─────────┤
+            │  ones   │  local  │  action tokens attend to all state
+            │         │  (tril) │  tokens + local window of action tokens
+            └─────────┴─────────┘
+
+        Returns:
+            ``(s_len + a_len, s_len + a_len)`` float mask.
+        """
+        s_len = state_len + 1  # +1 for sink token
+        a_len = action_len
+        mask_ss = torch.tril(torch.ones(s_len, s_len, device=device))
+        mask_sa = torch.zeros(s_len, a_len, device=device)
+        mask_as = torch.ones(a_len, s_len, device=device)
+        mask_aa = torch.tril(torch.ones(a_len, a_len, device=device))
+        mask_aa = mask_aa * torch.triu(
+            torch.ones(a_len, a_len, device=device), diagonal=-self.local_window
+        )
+        return torch.cat(
+            [torch.cat([mask_ss, mask_sa], dim=1),
+             torch.cat([mask_as, mask_aa], dim=1)], dim=0,
+        )
+
     def _random_mask_prefix(
         self,
         causal_mask: torch.Tensor,
@@ -809,19 +844,7 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
 
         # Attention mask with local causal window for action tokens
         # Use padded state length (not raw) to match position_ids / dit_query_length.
-        s_len = state_len + 1  # +1 for sink token
-        a_len = action_len
-        mask_ss = torch.tril(torch.ones(s_len, s_len, device=device))
-        mask_sa = torch.zeros(s_len, a_len, device=device)
-        mask_as = torch.ones(a_len, s_len, device=device)
-        mask_aa = torch.tril(torch.ones(a_len, a_len, device=device))
-        mask_aa = mask_aa * torch.triu(
-            torch.ones(a_len, a_len, device=device), diagonal=-self.local_window
-        )
-        causal_mask = torch.cat(
-            [torch.cat([mask_ss, mask_sa], dim=1),
-             torch.cat([mask_as, mask_aa], dim=1)], dim=0,
-        )
+        causal_mask = self._build_causal_mask(state_len, action_len, device)
         cache_mask = vlm_outputs.attention_mask[:, None, :].expand(-1, dit_query_length, -1)
         attn_mask = torch.cat(
             [cache_mask, causal_mask[None].expand(batch_size, -1, -1)], dim=-1
@@ -1079,19 +1102,7 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         position_embeds = model.rotary_emb(action_mask, position_ids)
 
         # Attention mask with local causal window for action tokens
-        s_len = state_length + 1  # +1 for sink token
-        a_len = action_length
-        mask_ss = torch.tril(torch.ones(s_len, s_len, device=action_mask.device))
-        mask_sa = torch.zeros(s_len, a_len, device=action_mask.device)
-        mask_as = torch.ones(a_len, s_len, device=action_mask.device)
-        mask_aa = torch.tril(torch.ones(a_len, a_len, device=action_mask.device))
-        mask_aa = mask_aa * torch.triu(
-            torch.ones(a_len, a_len, device=action_mask.device), diagonal=-self.local_window
-        )
-        causal_mask = torch.cat(
-            [torch.cat([mask_ss, mask_sa], dim=1),
-             torch.cat([mask_as, mask_aa], dim=1)], dim=0,
-        )
+        causal_mask = self._build_causal_mask(state_length, action_length, action_mask.device)
         cache_mask = vlm_outputs.attention_mask[:, None, :].expand(-1, dit_query_length, -1)
         attn_mask = torch.cat(
             [cache_mask, causal_mask[None].expand(action_bs, -1, -1)], dim=-1
@@ -1484,22 +1495,8 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
 
         cache_mask = cache_attn_mask[:, None, :].expand(-1, q_len, -1)
 
-        s_len = state_len + 1
-        a_len = action_len
-        mask_ss = torch.tril(torch.ones(s_len, s_len, device=device))
-        mask_sa = torch.zeros(s_len, a_len, device=device)
-        mask_as = torch.ones(a_len, s_len, device=device)
-        # P2_Local-style local causal mask: each action token attends to
-        # at most local_window previous tokens (matches original XR0.py).
-        mask_aa = torch.tril(torch.ones(a_len, a_len, device=device))
-        mask_aa = mask_aa * torch.triu(
-            torch.ones(a_len, a_len, device=device), diagonal=-self.local_window
-        )
-        causal_mask = torch.cat(
-            [torch.cat([mask_ss, mask_sa], dim=1),
-             torch.cat([mask_as, mask_aa], dim=1)],
-            dim=0,
-        )
+        # Causal mask with local window for action tokens (same as sample_actions)
+        causal_mask = self._build_causal_mask(state_len, action_len, device)
         attn_mask = torch.cat(
             [cache_mask, causal_mask[None].expand(batch_size, -1, -1)], dim=-1
         )[:, None].bool()
