@@ -58,6 +58,29 @@ def _temporarily_eval(module: torch.nn.Module):
         module.train(was_training)
 
 
+@contextmanager
+def _deterministic_seed(seed: int, device: torch.device):
+    """Run a block with a fixed seed, then restore both CPU and CUDA RNG.
+
+    ``torch.manual_seed`` seeds all devices, but ``torch.random.get_rng_state``
+    only captures CPU state.  This context manager saves and restores both,
+    so the caller's RNG sequence is not polluted.
+    """
+    cpu_state = torch.random.get_rng_state()
+    cuda_state = (
+        torch.cuda.get_rng_state(device)
+        if device.type == "cuda" and torch.cuda.is_available()
+        else None
+    )
+    torch.manual_seed(seed)
+    try:
+        yield
+    finally:
+        torch.random.set_rng_state(cpu_state)
+        if cuda_state is not None:
+            torch.cuda.set_rng_state(cuda_state, device)
+
+
 class XR0ForRLActionPrediction(nn.Module, BasePolicy):
     """RLinf policy wrapper for XR0 VLA checkpoints.
 
@@ -859,9 +882,7 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         # Seed RNG with prefix_length so the mask is deterministic and can be
         # exactly reproduced in default_forward during training replay.
         if mode == "train" and prefix_length > 2:
-            _rng_state = torch.random.get_rng_state()
-            torch.manual_seed(prefix_length)
-            try:
+            with _deterministic_seed(prefix_length, device):
                 causal_mask_for_prefix = self._random_mask_prefix(
                     causal_mask[None].expand(batch_size, -1, -1),
                     prefix_length, state_len,
@@ -869,8 +890,6 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
                 attn_mask = torch.cat(
                     [cache_mask, causal_mask_for_prefix], dim=-1
                 )[:, None].bool()
-            finally:
-                torch.random.set_rng_state(_rng_state)
 
         # Offset position IDs for non-prefix tokens (original XR0.py line 749-750)
         if prefix_length > 0 and action_len > prefix_length:
@@ -1505,9 +1524,7 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         # Seed RNG so the same prefix_length produces the same random mask
         # as during rollout, avoiding train/test attention pattern mismatch.
         if prefix_length > 2:
-            _rng_state = torch.random.get_rng_state()
-            torch.manual_seed(prefix_length)
-            try:
+            with _deterministic_seed(prefix_length, device):
                 causal_mask_prefixed = self._random_mask_prefix(
                     causal_mask[None].expand(batch_size, -1, -1),
                     prefix_length, state_len,
@@ -1515,8 +1532,6 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
                 attn_mask = torch.cat(
                     [cache_mask, causal_mask_prefixed], dim=-1
                 )[:, None].bool()
-            finally:
-                torch.random.set_rng_state(_rng_state)
 
         # Offset position IDs for non-prefix tokens (must match sample_actions)
         if prefix_length > 0 and action_len > prefix_length:
