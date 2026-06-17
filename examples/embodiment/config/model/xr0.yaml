@@ -59,7 +59,7 @@ xr0:
   dit_num_layers: 16
   dit_hidden_size: 1024
   local_window: 4
-  async_train: false  # TODO: prefix mask state_len inconsistency causes KL explosion
+  async_train: true
   training_repeat: 1  # Batch augmentation (supervised pretraining only)
   freq_coefficient: 0.0  # Frequency-domain loss weight (0 = disabled)
   enable_freq: false

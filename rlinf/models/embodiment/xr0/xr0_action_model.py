@@ -898,6 +898,7 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         if prefix_length > 0 and action_len > prefix_length:
             position_ids[:, :, -(action_len - prefix_length):] += 10
 
+
         # State embedding
         state_embed = self.xr0_model.state_projector(
             state_tensor_padded.to(device=device, dtype=torch.bfloat16)
@@ -978,7 +979,8 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             )
 
             # Save debug values at the chosen denoise step.
-            if _dbg and idx == denoise_ind and denoise_ind >= 0:
+            # Always store when async prefix is active for replay comparison.
+            if idx == denoise_ind and denoise_ind >= 0:
                 debug_v_t = v_t.detach().float().cpu()
                 mean_dbg, std_dbg = self._compute_denoise_mean_std(
                     chains[-1], v_t, timesteps, idx, mode="train"
@@ -1033,8 +1035,18 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             result["vlm_attention_mask"] = vlm_attention_mask.detach()
         result["vlm_pos_max"] = packed_pos_max
         result.update(packed_kv)
-        # Debug tensors for replay comparison (only when XR0_DEBUG=1).
-        if _dbg and debug_v_t is not None:
+        # Store position_embeds so replay uses the exact same rotary
+        # embeddings (Qwen3VLTextRotaryEmbedding is batch-size sensitive
+        # due to internal caching, so recomputing with B=1 gives wrong values).
+        if isinstance(position_embeds, tuple):
+            result["rope_cos"] = position_embeds[0].detach().cpu()
+            result["rope_sin"] = position_embeds[1].detach().cpu()
+        else:
+            result["rope_embeds"] = position_embeds.detach().cpu()
+        # Debug tensors for replay comparison.
+        # Always store when async prefix is active, regardless of XR0_DEBUG,
+        # so that default_forward can compare rollout vs replay v_t / mean / std.
+        if debug_v_t is not None:
             result["debug_v_t"] = debug_v_t
             result["debug_x_t_mean"] = debug_x_t_mean
             result["debug_x_t_std"] = debug_x_t_std
@@ -1309,9 +1321,11 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         if "vlm_hidden_states" in outputs:
             forward_inputs["vlm_hidden_states"] = outputs["vlm_hidden_states"].cpu()
             forward_inputs["vlm_attention_mask"] = outputs["vlm_attention_mask"].cpu()
-        # Store rollout-time VLM KV cache for exact training replay.
+        # Store rollout-time VLM KV cache and rotary embeddings for exact
+        # training replay.  rope_cos/sin must be stored because
+        # Qwen3VLTextRotaryEmbedding is batch-size sensitive (internal cache).
         for k, v in outputs.items():
-            if k.startswith("vlm_kv_") or k == "vlm_pos_max":
+            if k.startswith("vlm_kv_") or k in ("vlm_pos_max", "rope_cos", "rope_sin"):
                 if isinstance(v, torch.Tensor):
                     forward_inputs[k] = v.cpu()
                 else:
@@ -1393,7 +1407,6 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         denoise_inds = forward_inputs.get("denoise_inds")  # (B,)
         _pl = forward_inputs.get("prefix_length", torch.tensor([0]))
         prefix_length = int(_pl.flatten()[0].item())
-
         # Assert batch-global consistency: sample_actions() generates one
         # denoise_ind and prefix_length per batch, so all samples in a
         # micro-batch must agree.  If RLinf's cat/split ever mixes samples
@@ -1550,14 +1563,21 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
             state_tensor_padded.to(dtype=torch.bfloat16)
         )
 
-        dummy_action = torch.zeros(
-            (batch_size, action_len, self.action_dim),
-            device=device, dtype=torch.bfloat16,
-        )
-        position_embeds = self.xr0_model.rotary_emb(dummy_action, position_ids)
-
-        # Action mask already fetched above; expand for batch.
+        # Action mask: expand for batch (needed for DiT forward).
         action_mask = action_mask_base.expand(batch_size, -1, -1)
+
+        # Use stored position_embeds from rollout to avoid batch-size
+        # sensitivity in Qwen3VLTextRotaryEmbedding's internal cache.
+        _rope_cos = forward_inputs.get("rope_cos")
+        _rope_sin = forward_inputs.get("rope_sin")
+        if _rope_cos is not None and _rope_sin is not None:
+            position_embeds = (
+                _rope_cos.to(device=device, dtype=torch.bfloat16),
+                _rope_sin.to(device=device, dtype=torch.bfloat16),
+            )
+        else:
+            # Fallback: recompute (may differ from rollout if batch size differs)
+            position_embeds = self.xr0_model.rotary_emb(action_mask, position_ids)
 
         timesteps = torch.linspace(
             1.0, 0.0, self.num_steps + 1, device=device
@@ -1603,24 +1623,18 @@ class XR0ForRLActionPrediction(nn.Module, BasePolicy):
         )
 
         # Debug: compare rollout vs training v_t / mean / std.
-        if self._debug:
-            _dbg_v = forward_inputs.get("debug_v_t")
-            _dbg_mean = forward_inputs.get("debug_x_t_mean")
-            _dbg_std = forward_inputs.get("debug_x_t_std")
-            if _dbg_v is not None and _dbg_mean is not None and _dbg_std is not None:
-                _dbg_v = _dbg_v.to(device=device, dtype=v_t.dtype)
-                _dbg_mean = _dbg_mean.to(device=device, dtype=x_t_mean.dtype)
-                _dbg_std = _dbg_std.to(device=device, dtype=x_t_std.dtype)
-                v_diff = (v_t.float() - _dbg_v.float()).abs()
-                mean_diff = (x_t_mean.float() - _dbg_mean.float()).abs()
-                std_diff = (x_t_std.float() - _dbg_std.float()).abs()
-                normed_mean = mean_diff / _dbg_std.float().clamp_min(1e-6)
-                self.logger.debug(
-                    "[replay debug] v_diff: max=%.6f | mean_diff: max=%.6f | "
-                    "std_diff: max=%.6f | mean_diff/sigma: mean=%.6f max=%.6f",
-                    v_diff.max().item(), mean_diff.max().item(),
-                    std_diff.max().item(), normed_mean.mean().item(), normed_mean.max().item(),
-                )
+        # Always compare when debug tensors are available (async prefix mode).
+        _dbg_v = forward_inputs.get("debug_v_t")
+        _dbg_mean = forward_inputs.get("debug_x_t_mean")
+        _dbg_std = forward_inputs.get("debug_x_t_std")
+        if _dbg_v is not None and _dbg_mean is not None and _dbg_std is not None:
+            _dbg_v = _dbg_v.to(device=device, dtype=v_t.dtype)
+            _dbg_mean = _dbg_mean.to(device=device, dtype=x_t_mean.dtype)
+            _dbg_std = _dbg_std.to(device=device, dtype=x_t_std.dtype)
+            v_diff = (v_t.float() - _dbg_v.float()).abs()
+            mean_diff = (x_t_mean.float() - _dbg_mean.float()).abs()
+            std_diff = (x_t_std.float() - _dbg_std.float()).abs()
+            normed_mean = mean_diff / _dbg_std.float().clamp_min(1e-6)
 
         # Log-prob of recorded next state under current policy.
         # Return shape (B, num_action_chunks, action_dim) so that
