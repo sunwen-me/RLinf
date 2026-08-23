@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import json
+import os
+import sys
 
 import hydra
 import torch.multiprocessing as mp
@@ -29,12 +31,32 @@ from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 mp.set_start_method("spawn", force=True)
 
 
+def _drop_script_dir_from_sys_path() -> None:
+    """Keep the per-benchmark config directories from shadowing simulator packages.
+
+    Python prepends this script's directory to ``sys.path``, and the config
+    directories sitting next to it are named after the simulators they
+    configure (``evaluations/robocasa``, ``evaluations/libero``, ...).  Each is
+    a PEP 420 namespace portion, which beats a simulator installed in editable
+    mode: the editable install is served by a meta-path finder that never runs
+    once the path scan has produced a namespace spec, so ``import robocasa``
+    would return the YAML directory and no environment would be registered.
+    Ray copies the driver's ``sys.path`` into its workers, so the entry has to
+    go before any worker is created.
+    """
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    sys.path[:] = [
+        path for path in sys.path if os.path.abspath(path or os.curdir) != script_dir
+    ]
+
+
 @hydra.main(
     version_base="1.1",
     config_path="libero",
     config_name="libero_spatial_starvla_eval",
 )
 def main(cfg) -> None:
+    _drop_script_dir_from_sys_path()
     cfg.runner.task_type = "embodied_eval"
     cfg = validate_cfg(cfg)
     print(json.dumps(OmegaConf.to_container(cfg, resolve=True), indent=2))
