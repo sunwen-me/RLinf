@@ -82,6 +82,8 @@ Benchmark 指南
      - PolaRiS 桌面操作。
    * - :doc:`RoboTwin <guides/robotwin>`
      - RoboTwin 双臂操作。
+   * - :doc:`RoboCasa <guides/robocasa>`
+     - RoboCasa 厨房移动操作。
 
 参考
 ----

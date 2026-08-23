@@ -82,6 +82,8 @@ End-to-end evaluation workflows per benchmark (setup → config → launch → r
      - PolaRiS tabletop manipulation.
    * - :doc:`RoboTwin <guides/robotwin>`
      - RoboTwin bimanual manipulation.
+   * - :doc:`RoboCasa <guides/robocasa>`
+     - RoboCasa kitchen mobile manipulation.
 
 Reference
 ---------

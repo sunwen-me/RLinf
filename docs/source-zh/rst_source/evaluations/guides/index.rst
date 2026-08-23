@@ -28,6 +28,9 @@ Benchmark 指南
    * - RoboTwin
      - 双臂操作仿真，多任务场景
      - :doc:`robotwin`
+   * - RoboCasa
+     - 厨房级移动操作，原子任务
+     - :doc:`robocasa`
 
 .. note::
 
@@ -43,3 +46,4 @@ Benchmark 指南
    maniskill_ood
    polaris
    robotwin
+   robocasa

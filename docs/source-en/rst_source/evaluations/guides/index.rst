@@ -28,6 +28,9 @@ This section provides end-to-end evaluation workflows organized by benchmark. Ea
    * - RoboTwin
      - Bimanual manipulation simulation with multiple tasks
      - :doc:`robotwin`
+   * - RoboCasa
+     - Kitchen-scale mobile manipulation with atomic tasks
+     - :doc:`robocasa`
 
 .. note::
 
@@ -43,3 +46,4 @@ This section provides end-to-end evaluation workflows organized by benchmark. Ea
    maniskill_ood
    polaris
    robotwin
+   robocasa
