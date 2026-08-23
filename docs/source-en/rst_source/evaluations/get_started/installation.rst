@@ -23,6 +23,9 @@ Choose ``<model>`` and ``<env>`` to match your target benchmark:
    * - RoboTwin
      - ``openvla-oft`` / ``openpi`` / ``lingbotvla``
      - ``robotwin``
+   * - RoboCasa
+     - ``xr1`` / ``openpi``
+     - ``robocasa``
    * - BEHAVIOR-1K
      - ``openpi``
      - ``behavior``
@@ -49,6 +52,18 @@ Configure the following when your benchmark requires them:
 
    export ROBOTWIN_PATH=/path/to/RoboTwin
    export ROBOT_PLATFORM=ALOHA
+
+**RoboCasa**
+
+``ROBOCASA_PATH`` is optional and only lets the installer reuse an existing RoboCasa clone instead
+of cloning into the venv. Rendering, however, has to be set explicitly: ``run_eval.sh`` defaults
+``MUJOCO_GL`` **and** ``PYOPENGL_PLATFORM`` to ``osmesa`` independently, and robosuite refuses to
+start when only one of the two is switched, so export both to render on the GPU.
+
+.. code-block:: bash
+
+   export ROBOCASA_PATH=/path/to/robocasa   # optional
+   export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl
 
 **BEHAVIOR-1K**
 

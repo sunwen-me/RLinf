@@ -23,6 +23,9 @@
    * - RoboTwin
      - ``openvla-oft`` / ``openpi`` / ``lingbotvla``
      - ``robotwin``
+   * - RoboCasa
+     - ``xr1`` / ``openpi``
+     - ``robocasa``
    * - BEHAVIOR-1K
      - ``openpi``
      - ``behavior``
@@ -49,6 +52,18 @@ Benchmark 专属环境变量
 
    export ROBOTWIN_PATH=/path/to/RoboTwin
    export ROBOT_PLATFORM=ALOHA
+
+**RoboCasa**
+
+``ROBOCASA_PATH`` 是可选项，仅用于让安装脚本复用已有的 RoboCasa 仓库，而不是重新克隆到虚拟环境中。
+渲染方式则必须显式设置：``run_eval.sh`` 会把 ``MUJOCO_GL`` 和 ``PYOPENGL_PLATFORM``
+各自独立地默认为 ``osmesa``，而 robosuite 在两者只切换其中之一时会直接报错，
+因此要用 GPU 渲染就需要同时导出两个变量。
+
+.. code-block:: bash
+
+   export ROBOCASA_PATH=/path/to/robocasa   # 可选
+   export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl
 
 **BEHAVIOR-1K**
 

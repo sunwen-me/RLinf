@@ -28,6 +28,9 @@
    * - LingBotVLA
      - ``lingbotvla``
      - ``robotwin_click_bell_lingbotvla_eval``、``robotwin_place_shoe_lingbotvla_eval``
+   * - Xiaomi-Robotics-1（XR-1）
+     - ``xr1``
+     - ``robocasa_closedrawer_xr1_eval``
 
 模型路径设置
 ------------
