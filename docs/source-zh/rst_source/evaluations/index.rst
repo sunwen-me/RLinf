@@ -33,8 +33,8 @@ RLinf 提供统一的具身智能评测入口，支持在仿真或真机环境�
      - ``robotwin_place_empty_cup``、``robotwin_adjust_bottle``、``robotwin_place_shoe``、``robotwin_click_bell``
      - ``robotwin/robotwin_place_empty_cup_openvlaoft_eval.yaml`` 等
    * - RoboCasa
-     - ``robocasa_closedrawer``
-     - ``robocasa/robocasa_closedrawer_xr1_eval.yaml``
+     - ``robocasa_closedrawer``、``robocasa_opendrawer``、``robocasa_closedoubledoor`` 等 9 个原子任务，以及 ``robocasa_atomic_suite``
+     - ``robocasa/robocasa_closedrawer_xr1_eval.yaml``、``robocasa/robocasa_atomic_suite_xr1_eval.yaml`` 等
    * - RoboCasa365
      - ``robocasa365`` pretrain 任务切片
      - ``robocasa365/robocasa365_eval_openpi.yaml``

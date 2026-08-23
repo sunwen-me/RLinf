@@ -14,12 +14,13 @@ RL with RoboCasa Benchmark
 
 `RoboCasa <https://robocasa.ai/>`__ is a robosuite-based kitchen manipulation
 benchmark with diverse layouts, objects, and atomic tasks. You'll use RLinf to
-PPO-fine-tune an OpenPI π₀ policy on the RoboCasa ``CloseDrawer`` task.
+PPO-fine-tune an OpenPI π₀ policy on the RoboCasa ``CloseDrawer`` task; the same
+environment also hosts the XR-1 GRPO recipes across 9 atomic tasks (see :doc:`xr1`).
 
 Overview
 --------
 
-Fine-tune OpenPI π₀ on a mobile-manipulation kitchen task in RoboCasa.
+Fine-tune OpenPI π₀ or XR-1 on RoboCasa's mobile-manipulation kitchen tasks.
 
 .. grid:: 2 4 4 4
    :gutter: 2
@@ -27,17 +28,17 @@ Fine-tune OpenPI π₀ on a mobile-manipulation kitchen task in RoboCasa.
    .. grid-item-card:: Models
       :text-align: center
 
-      π₀
+      π₀ · XR-1
 
    .. grid-item-card:: Algorithms
       :text-align: center
 
-      PPO
+      PPO · GRPO
 
    .. grid-item-card:: Tasks
       :text-align: center
 
-      CloseDrawer
+      9 atomic tasks
 
    .. grid-item-card:: Hardware
       :text-align: center
@@ -58,6 +59,22 @@ Tasks
      - Description
    * - ``CloseDrawer``
      - Close a kitchen drawer with the PandaOmron mobile manipulator.
+   * - ``OpenDrawer``
+     - Open a kitchen drawer with the PandaOmron mobile manipulator.
+   * - ``CloseDoubleDoor``
+     - Close both doors of a two-door cabinet.
+   * - ``TurnOnStove``
+     - Turn on the requested stove burner knob.
+   * - ``TurnOffSinkFaucet``
+     - Turn off the sink faucet.
+   * - ``TurnSinkSpout``
+     - Swivel the sink spout to the requested side.
+   * - ``CoffeeSetupMug``
+     - Place a mug under the coffee-machine dispenser.
+   * - ``PnPCabToCounter``
+     - Pick an object from the cabinet and place it on the counter.
+   * - ``PnPCounterToSink``
+     - Pick an object from the counter and place it in the sink.
 
 Observation and Action
 ~~~~~~~~~~~~~~~~~~~~~~
@@ -79,8 +96,10 @@ Observation and Action
 
 .. note::
 
-   RoboCasa includes more atomic tasks, but the public RLinf recipe currently
-   targets ``CloseDrawer`` with ``examples/embodiment/config/robocasa_closedrawer_ppo_openpi.yaml``.
+   The OpenPI π₀ + PPO recipe targets ``CloseDrawer``
+   (``examples/embodiment/config/robocasa_closedrawer_ppo_openpi.yaml``). Every task in
+   the table above also has an XR-1 + GRPO recipe, and ``robocasa_atomic_suite_grpo_xr1``
+   trains 8 of them jointly; see :doc:`xr1`.
 
 Installation
 ------------
@@ -101,7 +120,8 @@ Installation
    # For mainland China users:
    # docker.1ms.run/rlinf/rlinf:agentic-rlinf0.4-robocasa
 
-Switch to the OpenPI virtual environment inside the image:
+Switch to the OpenPI virtual environment inside the image (use
+``source switch_env xr1`` for the XR-1 recipes):
 
 .. code:: bash
 
@@ -115,6 +135,7 @@ Install RoboCasa with the OpenPI dependencies:
 
    # Mainland China users can add --use-mirror.
    bash requirements/install.sh embodied --model openpi --env robocasa
+   # For the XR-1 recipes: bash requirements/install.sh embodied --model xr1 --env robocasa
    source .venv/bin/activate
 
 Download the kitchen assets after installing RoboCasa:
@@ -149,7 +170,7 @@ Download the OpenPI π₀ checkpoint:
 Run It
 ------
 
-Launch the CloseDrawer recipe:
+Launch a recipe:
 
 .. list-table::
    :header-rows: 1
@@ -161,6 +182,12 @@ Launch the CloseDrawer recipe:
    * - OpenPI π₀ + PPO
      - ``examples/embodiment/config/robocasa_closedrawer_ppo_openpi.yaml``
      - ``robocasa_closedrawer_ppo_openpi``
+   * - XR-1 + GRPO (one task)
+     - ``examples/embodiment/config/robocasa_<task>_grpo_xr1.yaml``
+     - ``robocasa_<task>_grpo_xr1``
+   * - XR-1 + GRPO (multi-task)
+     - ``examples/embodiment/config/robocasa_atomic_suite_grpo_xr1.yaml``
+     - ``robocasa_atomic_suite_grpo_xr1``
 
 .. code:: bash
 

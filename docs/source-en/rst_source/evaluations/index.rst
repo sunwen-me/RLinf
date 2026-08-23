@@ -33,8 +33,8 @@ The table below lists benchmarks that have example configs under ``evaluations/`
      - ``robotwin_place_empty_cup``, ``robotwin_adjust_bottle``, ``robotwin_place_shoe``, ``robotwin_click_bell``
      - ``robotwin/robotwin_place_empty_cup_openvlaoft_eval.yaml``, etc.
    * - RoboCasa
-     - ``robocasa_closedrawer``
-     - ``robocasa/robocasa_closedrawer_xr1_eval.yaml``
+     - ``robocasa_closedrawer``, ``robocasa_opendrawer``, ``robocasa_closedoubledoor``, etc. (9 atomic tasks), plus ``robocasa_atomic_suite``
+     - ``robocasa/robocasa_closedrawer_xr1_eval.yaml``, ``robocasa/robocasa_atomic_suite_xr1_eval.yaml``, etc.
    * - RoboCasa365
      - ``robocasa365`` pretrain task slices
      - ``robocasa365/robocasa365_eval_openpi.yaml``

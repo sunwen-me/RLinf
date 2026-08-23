@@ -14,12 +14,12 @@ robot foundation model that couples a **Qwen3-VL** backbone to a **Diffusion Tra
 action expert as a Mixture-of-Transformers: the DiT matches the VLM layer for layer, reuses
 its KV cache, and decodes action chunks with a rectified-flow head. RLinf integrates it
 **natively** — the HuggingFace checkpoint is loaded in RLinf's own memory space through
-``trust_remote_code`` — and GRPO-fine-tunes it on the RoboCasa ``CloseDrawer`` task.
+``trust_remote_code`` — and GRPO-fine-tunes it on RoboCasa's atomic kitchen tasks.
 
 Overview
 --------
 
-GRPO-fine-tune XR-1's action expert on a RoboCasa mobile-manipulation kitchen task.
+GRPO-fine-tune XR-1's action expert on RoboCasa mobile-manipulation kitchen tasks.
 
 .. grid:: 2 4 4 4
    :gutter: 2
@@ -37,7 +37,7 @@ GRPO-fine-tune XR-1's action expert on a RoboCasa mobile-manipulation kitchen ta
    .. grid-item-card:: Tasks
       :text-align: center
 
-      CloseDrawer
+      9 atomic tasks
 
    .. grid-item-card:: Hardware
       :text-align: center
@@ -50,18 +50,71 @@ GRPO-fine-tune XR-1's action expert on a RoboCasa mobile-manipulation kitchen ta
 Tasks
 ~~~~~
 
+Every task ships as a triplet: a model-agnostic env config
+(``examples/embodiment/config/env/robocasa_<task>.yaml``), a GRPO training config, and a
+standalone evaluation config (``evaluations/robocasa/robocasa_<task>_xr1_eval.yaml``).
+``max_episode_steps`` is chosen per task: short enough that part of every rollout group
+stays unsolved, because GRPO's baseline is the group mean and a group that always
+succeeds — or never does — yields a zero advantage.
+
 .. list-table::
    :header-rows: 1
-   :widths: 22 24 30 24
+   :widths: 22 32 12 34
 
-   * - Environment
-     - Task / Suite
-     - Config / Weights
-     - Focus
-   * - RoboCasa
-     - CloseDrawer
+   * - Task
+     - Config
+     - ``max_episode_steps``
+     - What it exercises
+   * - ``CloseDrawer``
      - ``robocasa_closedrawer_grpo_xr1``
-     - GRPO fine-tuning of the XR-1 action expert on a kitchen manipulation task.
+     - 200
+     - Close a kitchen drawer with the PandaOmron mobile manipulator.
+   * - ``OpenDrawer``
+     - ``robocasa_opendrawer_grpo_xr1``
+     - 500
+     - Open a kitchen drawer with the PandaOmron mobile manipulator.
+   * - ``CloseDoubleDoor``
+     - ``robocasa_closedoubledoor_grpo_xr1``
+     - 500
+     - Close both doors of a two-door cabinet.
+   * - ``TurnOnStove``
+     - ``robocasa_turnonstove_grpo_xr1``
+     - 500
+     - Turn on the requested stove burner knob.
+   * - ``TurnOffSinkFaucet``
+     - ``robocasa_turnoffsinkfaucet_grpo_xr1``
+     - 500
+     - Turn off the sink faucet.
+   * - ``TurnSinkSpout``
+     - ``robocasa_turnsinkspout_grpo_xr1``
+     - 500
+     - Swivel the sink spout to the requested side.
+   * - ``CoffeeSetupMug``
+     - ``robocasa_coffeesetupmug_grpo_xr1``
+     - 500
+     - Place a mug under the coffee-machine dispenser.
+   * - ``PnPCabToCounter``
+     - ``robocasa_pnpcabtocounter_grpo_xr1``
+     - 500
+     - Pick an object from the cabinet and place it on the counter.
+   * - ``PnPCounterToSink``
+     - ``robocasa_pnpcountertosink_grpo_xr1``
+     - 500
+     - Pick an object from the counter and place it in the sink.
+   * - Task suite
+     - ``robocasa_atomic_suite_grpo_xr1``
+     - 500
+     - Multi-task GRPO over all 8 tasks; every rollout group stays on one task.
+
+.. note::
+
+   When ``task_names`` holds several tasks, the task index advances once per
+   ``algorithm.group_size`` environments instead of once per environment, so a
+   group-relative baseline never averages two different tasks. Keep
+   ``env.train.total_num_envs`` a multiple of
+   ``algorithm.group_size × len(task_names)`` for balanced coverage — RLinf logs a
+   warning when it is not. RoboCasa cannot re-seed a scene on reset, so the episodes
+   inside one group are different kitchen layouts of the same task.
 
 Observation and Action
 ~~~~~~~~~~~~~~~~~~~~~~
@@ -180,8 +233,9 @@ Run It
 
 **1. Configuration**
 
-XR-1 + GRPO + RoboCasa ``CloseDrawer`` uses
-``examples/embodiment/config/robocasa_closedrawer_grpo_xr1.yaml``; the model defaults live
+Every recipe in the table above is
+``examples/embodiment/config/robocasa_<task>_grpo_xr1.yaml`` and takes its task list and
+horizon from the matching ``env/robocasa_<task>.yaml``; the model defaults live
 in ``examples/embodiment/config/model/xr1.yaml``. Point the paths at your download and
 keep the env spaces aligned with the checkpoint:
 
@@ -225,14 +279,21 @@ keep the env spaces aligned with the checkpoint:
 .. code:: bash
 
    export MUJOCO_GL=egl
+
+   # A single task
    bash examples/embodiment/run_embodiment.sh robocasa_closedrawer_grpo_xr1
+
+   # All 8 500-step tasks in one run, one task per rollout group
+   bash examples/embodiment/run_embodiment.sh robocasa_atomic_suite_grpo_xr1
 
 Evaluation
 ----------
 
-``evaluations/robocasa/robocasa_closedrawer_xr1_eval.yaml`` scores a checkpoint without
-training. It keeps the observation and action spaces of the training recipe but pins the
-initial states, so every run and every checkpoint is scored on the same episodes:
+Every training recipe has a matching
+``evaluations/robocasa/robocasa_<task>_xr1_eval.yaml`` that scores a checkpoint without
+training. It keeps the observation and action spaces, the task list, and the horizon of the
+training recipe but pins the initial states, so every run and every checkpoint is scored on
+the same episodes:
 
 .. code:: bash
 

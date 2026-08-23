@@ -14,12 +14,13 @@
 
 `RoboCasa <https://robocasa.ai/>`__ 是基于 robosuite 的厨房操作基准，包含多样化布局、
 物体和原子任务。你将使用 RLinf 在 RoboCasa ``CloseDrawer`` 任务上，通过 PPO 微调
-OpenPI π₀ 策略。
+OpenPI π₀ 策略；同一环境还承载 XR-1 在 9 个原子任务上的 GRPO 配方
+（见 :doc:`xr1`）。
 
 概览
 ----------------------------------------
 
-在 RoboCasa 的移动操作厨房任务上微调 OpenPI π₀。
+在 RoboCasa 的移动操作厨房任务上微调 OpenPI π₀ 或 XR-1。
 
 .. grid:: 2 4 4 4
    :gutter: 2
@@ -27,17 +28,17 @@ OpenPI π₀ 策略。
    .. grid-item-card:: 模型
       :text-align: center
 
-      π₀
+      π₀ · XR-1
 
    .. grid-item-card:: 算法
       :text-align: center
 
-      PPO
+      PPO · GRPO
 
    .. grid-item-card:: 任务
       :text-align: center
 
-      CloseDrawer
+      9 个原子任务
 
    .. grid-item-card:: 硬件
       :text-align: center
@@ -58,6 +59,22 @@ OpenPI π₀ 策略。
      - 描述
    * - ``CloseDrawer``
      - 使用 PandaOmron 移动机械臂关闭厨房抽屉。
+   * - ``OpenDrawer``
+     - 使用 PandaOmron 移动机械臂打开厨房抽屉。
+   * - ``CloseDoubleDoor``
+     - 关闭双开柜门。
+   * - ``TurnOnStove``
+     - 打开指定的炉灶旋钮。
+   * - ``TurnOffSinkFaucet``
+     - 关闭水槽水龙头。
+   * - ``TurnSinkSpout``
+     - 将水槽出水口转到指定一侧。
+   * - ``CoffeeSetupMug``
+     - 把杯子放到咖啡机出水口下方。
+   * - ``PnPCabToCounter``
+     - 从柜中拿起物体放到台面上。
+   * - ``PnPCounterToSink``
+     - 从台面拿起物体放入水槽。
 
 观测与动作
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -79,9 +96,10 @@ OpenPI π₀ 策略。
 
 .. note::
 
-   RoboCasa 包含更多原子任务，但当前公开的 RLinf 配方使用
-   ``examples/embodiment/config/robocasa_closedrawer_ppo_openpi.yaml`` 训练
-   ``CloseDrawer``。
+   OpenPI π₀ + PPO 配方针对 ``CloseDrawer``
+   （``examples/embodiment/config/robocasa_closedrawer_ppo_openpi.yaml``）。上表中的每个
+   任务都有一份 XR-1 + GRPO 配方，另有 ``robocasa_atomic_suite_grpo_xr1`` 在一次训练中联合优化
+   其中 8 个任务；详见 :doc:`xr1`。
 
 安装
 ----------------------------------------
@@ -102,7 +120,7 @@ OpenPI π₀ 策略。
    # 国内用户可使用：
    # docker.1ms.run/rlinf/rlinf:agentic-rlinf0.4-robocasa
 
-在镜像中切换到 OpenPI 虚拟环境：
+在镜像中切换到 OpenPI 虚拟环境（XR-1 配方请改用 ``source switch_env xr1``）：
 
 .. code:: bash
 
@@ -116,6 +134,7 @@ OpenPI π₀ 策略。
 
    # 国内用户可添加 --use-mirror。
    bash requirements/install.sh embodied --model openpi --env robocasa
+   # XR-1 配方：bash requirements/install.sh embodied --model xr1 --env robocasa
    source .venv/bin/activate
 
 安装 RoboCasa 后下载厨房资产：
@@ -150,7 +169,7 @@ OpenPI π₀ 策略。
 运行
 ----------------------------------------
 
-启动 CloseDrawer 配方：
+启动一个配方：
 
 .. list-table::
    :header-rows: 1
@@ -162,6 +181,12 @@ OpenPI π₀ 策略。
    * - OpenPI π₀ + PPO
      - ``examples/embodiment/config/robocasa_closedrawer_ppo_openpi.yaml``
      - ``robocasa_closedrawer_ppo_openpi``
+   * - XR-1 + GRPO（单任务）
+     - ``examples/embodiment/config/robocasa_<task>_grpo_xr1.yaml``
+     - ``robocasa_<task>_grpo_xr1``
+   * - XR-1 + GRPO（多任务）
+     - ``examples/embodiment/config/robocasa_atomic_suite_grpo_xr1.yaml``
+     - ``robocasa_atomic_suite_grpo_xr1``
 
 .. code:: bash
 

@@ -30,7 +30,7 @@
      - ``robotwin_click_bell_lingbotvla_eval``、``robotwin_place_shoe_lingbotvla_eval``
    * - Xiaomi-Robotics-1（XR-1）
      - ``xr1``
-     - ``robocasa_closedrawer_xr1_eval``
+     - ``robocasa_<task>_xr1_eval``\ （9 个原子任务，任务名见 :doc:`/rst_source/examples/embodied/xr1`）、``robocasa_atomic_suite_xr1_eval``
 
 模型路径设置
 ------------
