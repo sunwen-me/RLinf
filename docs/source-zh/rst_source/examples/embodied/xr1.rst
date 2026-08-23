@@ -19,7 +19,7 @@ rectified-flow 头解码动作块。RLinf **原生**\ 接入该模型——通�
 概览
 ----------------------------------------
 
-在 RoboCasa 的多个移动操作厨房任务上，用 GRPO 微调 XR-1 的动作专家。
+在 RoboCasa 的多个移动操作厨房任务上，用 GRPO 或 PPO 微调 XR-1 的动作专家。
 
 .. grid:: 2 4 4 4
    :gutter: 2
@@ -52,7 +52,8 @@ rectified-flow 头解码动作块。RLinf **原生**\ 接入该模型——通�
 
 每个任务都以三件套的形式提供：与模型无关的环境配置
 （``examples/embodiment/config/env/robocasa_<task>.yaml``）、GRPO 训练配置，以及独立评测配置
-（``evaluations/robocasa/robocasa_<task>_xr1_eval.yaml``）。``max_episode_steps`` 取
+（``evaluations/robocasa/robocasa_<task>_xr1_eval.yaml``）。``CloseDrawer`` 另外提供一份
+PPO 配方 ``robocasa_closedrawer_ppo_xr1.yaml``。``max_episode_steps`` 取
 RoboCasa 为该任务本身设定的时域，配方不做改动；只有 ``CloseDrawer`` 从 300 步缩短为 200 步，
 因为已发布的权重在 300 步的 episode 中每次都能关上抽屉。
 
@@ -115,7 +116,7 @@ RoboCasa 为该任务本身设定的时域，配方不做改动；只有 ``Close
 
 时域能否给 GRPO 留出空间取决于权重本身。训练时 episode 一旦成功就会终止，因此一条轨迹的
 得分实际上等价于“该 episode 是否在 ``max_episode_steps`` 内成功”——即 ``success_once``，
-而不是 ``success_at_end``（评测配置使用 ``ignore_terminations: True``，成功后仍会继续运行，
+而不是 ``success_at_end``\ （评测配置使用 ``ignore_terminations: True``，成功后仍会继续运行，
 状态可能被破坏）。GRPO 随后会减去组均值：组内全部成功——或全部失败——的优势恒为零，也就
 不产生梯度。下表是用上面的评测配置对已发布 SFT 权重做的两次独立测量，每次都是同样 8 个固定
 种子 episode（动作专家本身随机采样，8 个 episode 在两次之间最多相差 0.25——请把两列当作区间
@@ -326,9 +327,8 @@ XR-1 的建模代码随检查点一起发布，无需额外克隆仓库。请使
 .. note::
 
    ``max_steps_per_rollout_epoch`` 必须是 ``num_action_chunks``\ （10）的整数倍，
-   以保证每个 rollout epoch 都在动作块边界结束。若要用 PPO 替代 GRPO，请设置
-   ``algorithm.adv_type: gae``、``algorithm.loss_type: actor_critic`` 和
-   ``actor.model.add_value_head: True``。
+   以保证每个 rollout epoch 都在动作块边界结束。PPO 的配置见
+   ``robocasa_closedrawer_ppo_xr1.yaml``，详见 `用 PPO 替代 GRPO`_。
 
 **2. 启动**
 
@@ -342,6 +342,9 @@ XR-1 的建模代码随检查点一起发布，无需额外克隆仓库。请使
    # 在一次训练中覆盖 8 个 500 步任务，每个 rollout group 只跑一个任务
    bash examples/embodiment/run_embodiment.sh robocasa_atomic_suite_grpo_xr1
 
+   # 与 GRPO 配方使用同一任务、同一时域的 PPO
+   bash examples/embodiment/run_embodiment.sh robocasa_closedrawer_ppo_xr1
+
 .. note::
 
    每个 RoboCasa 环境都在独立子进程中加载完整的 MuJoCo 场景，单个进程约占 6--8 GB 主机内存，
@@ -349,6 +352,73 @@ XR-1 的建模代码随检查点一起发布，无需额外克隆仓库。请使
    之前就会耗尽内存。配置中的默认值沿用了既有 ``robocasa_closedrawer_ppo_openpi`` 配方的规模，
    请按机器实际内存下调；多任务配方在下调后仍应保持为
    ``algorithm.group_size x len(task_names)`` 的整数倍。
+
+.. note::
+
+   所有 XR-1 配方都设置了 ``runner.save_interval: -1``，即默认不写权重：一份合并后的 XR-1
+   state dict 约 23 GB，按默认间隔保存几百步就能把磁盘写满。需要保留中间权重时，把它改成
+   正整数步数即可。环境的视频配置同样会往 ``<runner.logger.log_path>/video`` 写文件，磁盘
+   紧张时请关闭 ``save_video``。
+
+用 PPO 替代 GRPO
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``robocasa_closedrawer_ppo_xr1.yaml`` 与 GRPO 配方使用同一任务、同一时域、同一套观测与
+动作空间，区别只在优势的估计方式：
+
+.. code:: yaml
+
+   algorithm:
+     group_size: 1            # PPO 用价值头而不是同组轨迹作为基线
+     adv_type: gae
+     loss_type: actor_critic
+     gamma: 0.99              # 稀疏的终止奖励，折扣方式沿用 OpenPI 配方
+     gae_lambda: 0.95
+
+   actor:
+     model:
+       add_value_head: True   # loss_type: actor_critic 的必要条件
+       xr1:
+         value_after_vlm: False    # critic 读取 DiT 后缀的均值池化结果
+         detach_critic_input: True # 价值损失不会回传到动作专家
+     optim:
+       value_lr: 1.0e-4
+       critic_warmup_steps: 0      # 调大可先单独训练新初始化的 critic，再让策略跟随其优势
+
+价值头是挂在 DiT 后缀上的 MLP，并不包含在 SFT 权重里，因此它从随机初始化开始，最初几步的
+预测没有意义。这正是它与 GRPO 的取舍：在权重已经能稳定完成的任务上（同组每条轨迹得分相同、
+GRPO 优势恒为 0），PPO 仍然有可用的梯度；代价是必须先从零学出一个 critic，早期 ``value_lr``、
+``critic_warmup_steps`` 与 ``value_clip`` 都会明显影响结果。
+
+在单卡 A800 上以探测规模实测（``env.train.total_num_envs=8``\ 、
+``env.train.rollout_epoch=1``\ 、``actor.global_batch_size=16``\ 、
+``algorithm.update_epoch=1``\ ，即一个训练步恰好是 10 个优化器步），起点为 SFT 权重。
+在 ``critic_warmup_steps: 0`` 下，第一步就是一次真实的 PPO 更新：``advantages_max`` 2.561、
+``advantages_min`` -2.621（均值为 0），``actor/grad_norm`` 109.0、``actor/approx_kl`` 0.286、
+``actor/clip_fraction`` 0.190、``critic/value_loss`` 0.069，该批 ``env/success_once`` 为 0.875。
+把 ``critic_warmup_steps`` 改成 10（即整整一个训练步只训 critic）后，行为与设计一致：
+第 1 步的 ``actor/lr`` 与 ``actor/policy_loss`` 均为 0，``critic/value_loss`` 降到 0.226；
+第 2 步才是第一次真正的策略更新，且更温和：``actor/grad_norm`` 61.2、``actor/approx_kl`` 0.224、
+``critic/value_loss`` 0.063。两次运行采到的 episode 并不相同，8 个 episode 也谈不上受控对比 ——
+请把它当作方向而不是测量值。配方仍保持 ``critic_warmup_steps: 0``\ ，与仓库中其他 PPO 配方一致。
+
+.. note::
+
+   ``critic_warmup_steps`` 计的是\ **优化器**\ 步，而不是训练步::
+
+      每训练步的样本数 = total_num_envs x rollout_epoch
+                        x max_steps_per_rollout_epoch / num_action_chunks
+      优化器步数       = 样本数 / global_batch_size x update_epoch
+
+   按配方给出的默认值，每个训练步是 40 个优化器步（上面的探测规模是 10 个），
+   因此小于一个训练步的 warmup 会在训练步中途结束。
+
+.. note::
+
+   当一批数据接近饱和时，``critic/explained_variance`` 不可用：8 个 episode 全部成功时
+   returns 只分布在 0.920--1.079 之间，该指标读出 -88.9，而 ``critic/value_loss`` 其实
+   仍在下降。这种情况下请看 ``critic/value_loss``\ ，并把 ``critic/value_clip_ratio``
+   理解为 critic 相对 rollout 时刻移动了多少。
 
 评测
 ----------------------------------------

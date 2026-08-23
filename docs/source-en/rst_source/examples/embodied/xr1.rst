@@ -19,7 +19,8 @@ its KV cache, and decodes action chunks with a rectified-flow head. RLinf integr
 Overview
 --------
 
-GRPO-fine-tune XR-1's action expert on RoboCasa mobile-manipulation kitchen tasks.
+Fine-tune XR-1's action expert with GRPO or PPO on RoboCasa mobile-manipulation
+kitchen tasks.
 
 .. grid:: 2 4 4 4
    :gutter: 2
@@ -53,6 +54,7 @@ Tasks
 Every task ships as a triplet: a model-agnostic env config
 (``examples/embodiment/config/env/robocasa_<task>.yaml``), a GRPO training config, and a
 standalone evaluation config (``evaluations/robocasa/robocasa_<task>_xr1_eval.yaml``).
+``CloseDrawer`` also ships a PPO recipe, ``robocasa_closedrawer_ppo_xr1.yaml``.
 ``max_episode_steps`` is the horizon RoboCasa itself allows for the task. The recipes keep
 it unchanged, except for ``CloseDrawer``, which is shortened from 300 to 200 steps because
 the released checkpoint closes the drawer in every 300-step episode.
@@ -339,9 +341,8 @@ keep the env spaces aligned with the checkpoint:
 .. note::
 
    ``max_steps_per_rollout_epoch`` must stay a multiple of ``num_action_chunks`` (10) so
-   every rollout epoch ends on a chunk boundary. For PPO instead of GRPO, set
-   ``algorithm.adv_type: gae``, ``algorithm.loss_type: actor_critic``, and
-   ``actor.model.add_value_head: True``.
+   every rollout epoch ends on a chunk boundary. PPO is configured in
+   ``robocasa_closedrawer_ppo_xr1.yaml``; see `PPO instead of GRPO`_.
 
 **2. Launch**
 
@@ -355,6 +356,9 @@ keep the env spaces aligned with the checkpoint:
    # All 8 500-step tasks in one run, one task per rollout group
    bash examples/embodiment/run_embodiment.sh robocasa_atomic_suite_grpo_xr1
 
+   # PPO on the same task and horizon as the GRPO recipe
+   bash examples/embodiment/run_embodiment.sh robocasa_closedrawer_ppo_xr1
+
 .. note::
 
    Every RoboCasa environment runs in its own subprocess with a full MuJoCo scene and
@@ -363,6 +367,81 @@ keep the env spaces aligned with the checkpoint:
    values follow the scale of the existing ``robocasa_closedrawer_ppo_openpi`` recipe --
    lower them to fit your machine, and for a multi-task recipe keep the reduced value a
    multiple of ``algorithm.group_size x len(task_names)``.
+
+.. note::
+
+   Every XR-1 recipe ships with ``runner.save_interval: -1``, so no weights are written
+   unless you ask for them: one consolidated XR-1 state dict is roughly 23 GB, and the
+   default ``val_check_interval`` alone would fill a disk within a few hundred steps. Set
+   it to a positive number of steps to keep intermediate checkpoints. The env video
+   configs also write to ``<runner.logger.log_path>/video``; turn ``save_video`` off when
+   space is tight.
+
+PPO instead of GRPO
+~~~~~~~~~~~~~~~~~~~
+
+``robocasa_closedrawer_ppo_xr1.yaml`` trains the same task, horizon and observation spaces
+as the GRPO recipe, and differs only in how the advantage is estimated:
+
+.. code:: yaml
+
+   algorithm:
+     group_size: 1            # PPO scores a trajectory against the value head, not a group
+     adv_type: gae
+     loss_type: actor_critic
+     gamma: 0.99              # sparse terminal reward, discounted as in the OpenPI recipe
+     gae_lambda: 0.95
+
+   actor:
+     model:
+       add_value_head: True   # required by loss_type: actor_critic
+       xr1:
+         value_after_vlm: False    # critic reads the mean-pooled DiT suffix
+         detach_critic_input: True # the value loss never reaches the action expert
+     optim:
+       value_lr: 1.0e-4
+       critic_warmup_steps: 0      # raise to train the fresh critic before the policy moves
+
+The value head is an MLP on top of the DiT suffix; it is not part of the SFT release, so it
+starts from random weights and its first predictions are meaningless. That is the trade-off
+against GRPO: PPO keeps a usable gradient on a task the checkpoint already solves --- where
+every episode in a group returns the same score and the GRPO advantage is identically
+zero --- but it has to learn a critic from scratch first, and ``value_lr``,
+``critic_warmup_steps`` and ``value_clip`` all matter early on.
+
+Measured on one A800 at probe scale (``env.train.total_num_envs=8``,
+``env.train.rollout_epoch=1``, ``actor.global_batch_size=16``,
+``algorithm.update_epoch=1`` -- so one training step is exactly 10 optimizer steps),
+starting from the SFT release. With ``critic_warmup_steps: 0`` the very first step is
+already a real PPO update: ``advantages_max`` 2.561 and ``advantages_min`` -2.621 around a
+zero mean, ``actor/grad_norm`` 109.0, ``actor/approx_kl`` 0.286, ``actor/clip_fraction``
+0.190, ``critic/value_loss`` 0.069, on ``env/success_once`` 0.875. Repeating it with
+``critic_warmup_steps: 10`` -- one full training step of critic-only updates -- behaves as
+designed: step 1 logs ``actor/lr`` 0 and ``actor/policy_loss`` 0 while
+``critic/value_loss`` drops to 0.226, and the first real policy update, in step 2, lands
+gentler at ``actor/grad_norm`` 61.2, ``actor/approx_kl`` 0.224 and ``critic/value_loss``
+0.063. The two runs sampled different episodes, and eight episodes are not a controlled
+comparison -- read it as a direction, not a measurement. The recipe keeps
+``critic_warmup_steps: 0``, as every other PPO recipe in the repository does.
+
+.. note::
+
+   ``critic_warmup_steps`` counts **optimizer** steps, not training steps::
+
+      samples per training step = total_num_envs x rollout_epoch
+                                  x max_steps_per_rollout_epoch / num_action_chunks
+      optimizer steps           = samples / global_batch_size x update_epoch
+
+   That is 40 optimizer steps per training step at the shipped values and 10 at the probe
+   scale above, so a warmup shorter than one training step ends in the middle of one.
+
+.. note::
+
+   ``critic/explained_variance`` is unusable when a batch is near-saturated: with all eight
+   episodes succeeding, the returns spanned only 0.920--1.079, and the metric read -88.9
+   while ``critic/value_loss`` was in fact still improving. Watch ``critic/value_loss``
+   instead, and read ``critic/value_clip_ratio`` as how far the critic moved since the
+   rollout.
 
 Evaluation
 ----------
