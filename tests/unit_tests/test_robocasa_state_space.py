@@ -24,15 +24,14 @@ import types
 
 import numpy as np
 import pytest
-
-from rlinf.envs.robocasa.utils import (
+from _robocasa_utils import (
     ROBOCASA_BASE_STATE_DIM,
     ROBOCASA_BASE_STATES,
     ROBOCASA_EXTRA_STATES,
     ROBOCASA_JOINT_STATE_DIM,
     ROBOCASA_STATES,
     STATE_SPACE_STR_MAPPING,
-    _check_state_space,
+    check_state_space,
     get_state_ids,
     get_state_space,
 )
@@ -67,7 +66,7 @@ def test_state_registry_merges_without_shadowing_the_base_block():
 def test_preset_widths_and_uniqueness(preset, width):
     state_space = get_state_space(preset)
     assert state_space == STATE_SPACE_STR_MAPPING[preset]
-    assert _check_state_space(state_space)
+    assert check_state_space(state_space)
     ids = get_state_ids(state_space)
     assert len(ids) == width
     assert len(set(ids)) == width
