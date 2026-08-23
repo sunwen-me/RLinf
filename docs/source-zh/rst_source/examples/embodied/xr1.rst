@@ -52,9 +52,9 @@ rectified-flow 头解码动作块。RLinf **原生**\ 接入该模型——通�
 
 每个任务都以三件套的形式提供：与模型无关的环境配置
 （``examples/embodiment/config/env/robocasa_<task>.yaml``）、GRPO 训练配置，以及独立评测配置
-（``evaluations/robocasa/robocasa_<task>_xr1_eval.yaml``）。``max_episode_steps`` 按任务单独
-选取：要短到让每个 rollout group 中仍有一部分 episode 未完成——GRPO 的基线是组均值，
-全成功或全失败的组优势恒为零。
+（``evaluations/robocasa/robocasa_<task>_xr1_eval.yaml``）。``max_episode_steps`` 取
+RoboCasa 为该任务本身设定的时域，配方不做改动；只有 ``CloseDrawer`` 从 300 步缩短为 200 步，
+因为已发布的权重在 300 步的 episode 中每次都能关上抽屉。
 
 .. list-table::
    :header-rows: 1
@@ -112,6 +112,67 @@ rectified-flow 头解码动作块。RLinf **原生**\ 接入该模型——通�
    次数均衡，请将 ``env.train.total_num_envs`` 设为
    ``algorithm.group_size × len(task_names)`` 的整数倍——否则 RLinf 会打印警告。RoboCasa
    无法在 reset 时更换场景，因此同一组内的 episode 是同一任务的不同厨房布局。
+
+时域能否给 GRPO 留出空间取决于权重本身。训练时 episode 一旦成功就会终止，因此一条轨迹的
+得分实际上等价于“该 episode 是否在 ``max_episode_steps`` 内成功”；而 GRPO 会减去组均值：
+组内全部成功——或全部失败——的优势恒为零，也就不产生梯度。用上面的评测配置为已发布的 SFT
+权重打分（每个任务 8 个固定种子 episode，各只采样一次；动作专家本身是随机采样的，因此相近
+的数值之间属于噪声范围）：
+
+.. list-table::
+   :header-rows: 1
+   :widths: 28 20 18 34
+
+   * - 任务
+     - ``max_episode_steps``
+     - ``success_once``
+     - 更短时域的探测结果
+   * - ``CloseDrawer``
+     - 200
+     - 1.00
+     - 150 → 0.00、100 → 0.00
+   * - ``OpenDrawer``
+     - 500
+     - 1.00
+     - 350 → 0.875、200 → 0.375
+   * - ``CloseDoubleDoor``
+     - 500
+     - 1.00
+     - 350 → 0.00、200 → 0.00
+   * - ``TurnOnStove``
+     - 500
+     - 0.50
+     - 200 → 0.625
+   * - ``TurnOffSinkFaucet``
+     - 500
+     - 0.75
+     - 200 → 0.875
+   * - ``TurnSinkSpout``
+     - 500
+     - 0.875
+     - 200 → 0.625
+   * - ``CoffeeSetupMug``
+     - 500
+     - 0.75
+     - 200 → 0.00
+   * - ``PnPCabToCounter``
+     - 500
+     - 0.625
+     - 200 → 0.00
+   * - ``PnPCounterToSink``
+     - 500
+     - 0.25
+     - 200 → 0.00
+
+9 个任务中有 6 个在原时域下仍有区分度。``CloseDrawer``、``OpenDrawer`` 和
+``CloseDoubleDoor`` 出现了饱和；在 ``OpenDrawer`` + ``CloseDoubleDoor`` 上跑一步 GRPO 就能
+看到代价：``advantages_max``、``advantages_mean``、``advantages_min`` 与 ``actor/grad_norm``
+全为 0，而同样的一步在 ``TurnOnStove`` 上得到 ``advantages_max`` 0.87、``actor/grad_norm``
+133.5。首先可以尝试缩短 ``max_episode_steps``——350 步下 ``OpenDrawer`` 为 0.875；但成功率
+不是平滑下降而是崖式跳变：``CloseDoubleDoor`` 从 500 步的 1.00 直接降到 350 步的 0.00，
+``CloseDrawer`` 从 200 步的 1.00 降到 150 步的 0.00，而 200 步对咖啡和抓放类任务已经太短。
+``CloseDrawer`` 在配方的 200 步下本次测得 1.00，而更早一次测得 0.625——这就是处在崖边的
+表现：改动任何时域后请重新测量，并尽量多重复几次而不是只采一个样本。
 
 观测与动作
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -278,6 +339,14 @@ XR-1 的建模代码随检查点一起发布，无需额外克隆仓库。请使
 
    # 在一次训练中覆盖 8 个 500 步任务，每个 rollout group 只跑一个任务
    bash examples/embodiment/run_embodiment.sh robocasa_atomic_suite_grpo_xr1
+
+.. note::
+
+   每个 RoboCasa 环境都在独立子进程中加载完整的 MuJoCo 场景，单个进程约占 6--8 GB 主机内存，
+   因此 ``total_num_envs`` 的上限通常由主机内存而非显存决定：115 GB 内存的机器在 16 个环境
+   之前就会耗尽内存。配置中的默认值沿用了既有 ``robocasa_closedrawer_ppo_openpi`` 配方的规模，
+   请按机器实际内存下调；多任务配方在下调后仍应保持为
+   ``algorithm.group_size x len(task_names)`` 的整数倍。
 
 评测
 ----------------------------------------

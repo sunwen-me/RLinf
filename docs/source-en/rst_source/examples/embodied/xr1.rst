@@ -53,9 +53,9 @@ Tasks
 Every task ships as a triplet: a model-agnostic env config
 (``examples/embodiment/config/env/robocasa_<task>.yaml``), a GRPO training config, and a
 standalone evaluation config (``evaluations/robocasa/robocasa_<task>_xr1_eval.yaml``).
-``max_episode_steps`` is chosen per task: short enough that part of every rollout group
-stays unsolved, because GRPO's baseline is the group mean and a group that always
-succeeds — or never does — yields a zero advantage.
+``max_episode_steps`` is the horizon RoboCasa itself allows for the task. The recipes keep
+it unchanged, except for ``CloseDrawer``, which is shortened from 300 to 200 steps because
+the released checkpoint closes the drawer in every 300-step episode.
 
 .. list-table::
    :header-rows: 1
@@ -115,6 +115,72 @@ succeeds — or never does — yields a zero advantage.
    ``algorithm.group_size × len(task_names)`` for balanced coverage — RLinf logs a
    warning when it is not. RoboCasa cannot re-seed a scene on reset, so the episodes
    inside one group are different kitchen layouts of the same task.
+
+Whether a horizon leaves room for GRPO depends on the checkpoint. A training episode ends
+as soon as the task succeeds, so a trajectory's score is effectively "did this episode
+succeed within ``max_episode_steps``", and GRPO subtracts the group mean: a group whose
+episodes all succeed — or all fail — has an identically zero advantage and contributes no
+gradient. The released SFT checkpoint, scored with the evaluation configs above (eight
+fixed-seed episodes per task, one sample each; the action expert samples stochastically, so
+nearby values are within noise of one another):
+
+.. list-table::
+   :header-rows: 1
+   :widths: 28 20 18 34
+
+   * - Task
+     - ``max_episode_steps``
+     - ``success_once``
+     - Shorter horizons probed
+   * - ``CloseDrawer``
+     - 200
+     - 1.00
+     - 150 → 0.00, 100 → 0.00
+   * - ``OpenDrawer``
+     - 500
+     - 1.00
+     - 350 → 0.875, 200 → 0.375
+   * - ``CloseDoubleDoor``
+     - 500
+     - 1.00
+     - 350 → 0.00, 200 → 0.00
+   * - ``TurnOnStove``
+     - 500
+     - 0.50
+     - 200 → 0.625
+   * - ``TurnOffSinkFaucet``
+     - 500
+     - 0.75
+     - 200 → 0.875
+   * - ``TurnSinkSpout``
+     - 500
+     - 0.875
+     - 200 → 0.625
+   * - ``CoffeeSetupMug``
+     - 500
+     - 0.75
+     - 200 → 0.00
+   * - ``PnPCabToCounter``
+     - 500
+     - 0.625
+     - 200 → 0.00
+   * - ``PnPCounterToSink``
+     - 500
+     - 0.25
+     - 200 → 0.00
+
+Six of the nine tasks leave spread at the shipped horizon. ``CloseDrawer``, ``OpenDrawer``
+and ``CloseDoubleDoor`` came out saturated, and a one-step GRPO run over
+``OpenDrawer`` + ``CloseDoubleDoor`` shows what that costs: ``advantages_max``,
+``advantages_mean``, ``advantages_min`` and ``actor/grad_norm`` were all exactly 0, while
+the same step on ``TurnOnStove`` reached ``advantages_max`` 0.87 and ``actor/grad_norm``
+133.5. Shortening ``max_episode_steps`` is the first thing to try — 350 steps put
+``OpenDrawer`` at 0.875 — but success falls off a cliff instead of degrading smoothly:
+``CloseDoubleDoor`` goes from 1.00 to 0.00 between 500 and 350 steps, ``CloseDrawer`` from
+1.00 to 0.00 between 200 and 150, and 200 steps is already too short for the coffee and
+pick-and-place tasks. ``CloseDrawer`` at its shipped 200 scored 1.00 in this sweep and
+0.625 in an earlier one, which is what sitting on that edge looks like: re-measure any
+value you change, and prefer several samples over one.
 
 Observation and Action
 ~~~~~~~~~~~~~~~~~~~~~~
@@ -285,6 +351,15 @@ keep the env spaces aligned with the checkpoint:
 
    # All 8 500-step tasks in one run, one task per rollout group
    bash examples/embodiment/run_embodiment.sh robocasa_atomic_suite_grpo_xr1
+
+.. note::
+
+   Every RoboCasa environment runs in its own subprocess with a full MuJoCo scene and
+   holds roughly 6--8 GB of host RAM, so ``total_num_envs`` is bounded by system memory
+   long before GPU memory: a 115 GB host runs out well below 16 environments. The shipped
+   values follow the scale of the existing ``robocasa_closedrawer_ppo_openpi`` recipe --
+   lower them to fit your machine, and for a multi-task recipe keep the reduced value a
+   multiple of ``algorithm.group_size x len(task_names)``.
 
 Evaluation
 ----------
