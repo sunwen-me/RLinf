@@ -109,6 +109,18 @@ If you are starting from "I want to train or RL-fine-tune model *X*", this is th
        </p>
      </div>
 
+     <!-- TODO: swap for a pic/xr1.png in RLinf/misc once an architecture figure is available. -->
+     <div style="flex: 1 1 30%; max-width: 300px; text-align: center;">
+       <a href="embodied/xr1.html" style="display: block;"><img src="https://raw.githubusercontent.com/RLinf/misc/main/pic/robocasa.jpeg"
+            style="width: 100%; height: 200px; object-fit: cover; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.15);" /></a>
+       <p style="margin-top: 8px; font-size: 14px; line-height: 1.4;">
+         <a href="embodied/xr1.html" style="text-decoration: underline; color: blue;">
+           <b>RL on Xiaomi-Robotics-1</b>
+         </a><br>
+         XR-1 (Qwen3-VL + DiT) with RoboCasa GRPO training
+       </p>
+     </div>
+
    </div>
 
 .. toctree::
@@ -124,3 +136,4 @@ If you are starting from "I want to train or RL-fine-tune model *X*", this is th
    Lingbot-VLA <embodied/lingbotvla>
    Evo-1 <embodied/evo1>
    ABot-M0 <embodied/abot_m0>
+   XR-1 <embodied/xr1>

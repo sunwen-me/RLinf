@@ -1,0 +1,73 @@
+model_type: "xr1"
+
+# Model paths - should be overridden in specific experiment configs or via CLI.
+# `model_path` must point at the HuggingFace `trust_remote_code` export of
+# Xiaomi-Robotics-1 (config.json with `model_type: mibot`, `modeling_mibot.py`,
+# `processing_mibot.py`).  The processor lives in the same directory by default.
+model_path: "/path/to/Xiaomi-Robotics-1-RoboCasa"
+
+precision: "bf16"
+
+# XR-1 predicts a fixed 10-step action chunk; `num_action_chunks` is validated
+# against the action statistics shipped with the processor and cannot be changed.
+num_action_chunks: 10
+# Number of leading action dimensions handed to the environment.
+action_dim: 7
+
+# LoRA settings
+is_lora: False
+lora_rank: 4
+
+# Number of Euler steps of the rectified-flow action head. Must match the
+# checkpoint's training recipe; XR-1 ships with 5.
+num_steps: 5
+
+# GRPO does not need a critic; set this to True together with
+# `algorithm.loss_type: actor_critic` for PPO-style training.
+add_value_head: False
+# "action_expert" trains the DiT, the projectors and the heads while the
+# Qwen3-VL backbone stays frozen. Set to "all" to fine-tune the whole model
+# (needs far more memory: the VLM prefix then runs with gradients enabled).
+rl_trainable_scope: "action_expert"
+
+# The Qwen3-VL text model ties `embed_tokens` and `lm_head`; telling the FSDP
+# wrap policy about it keeps the tied embedding out of its own FSDP unit.
+tie_word_embeddings: True
+
+# XR-1 specific parameters
+xr1:
+  # Key into the processor's per-embodiment action statistics / action mask.
+  robot_type: "robocasa_mg"
+
+  # Vision preprocessing: center crop, then resize to image_size x image_size.
+  # 256 px with patch 16 and merge 2 gives 64 visual tokens per view.
+  image_size: 256
+  crop_ratio: 0.95
+  # Fixed prompt width (left padded). 3 views * 64 tokens + the instruction
+  # template fits in 320 tokens.
+  max_prompt_length: 320
+
+  # Indices into the environment state vector, in the order XR-1 expects:
+  # seven arm joint positions followed by the gripper opening.
+  # For RoboCasa this requires `state_space: 32d` and `include_joint_state: True`.
+  state_indices: [25, 26, 27, 28, 29, 30, 31, 7]
+
+  # Exploration: the deterministic Euler sampler is treated as an SDE so that
+  # every denoising step has a tractable Gaussian log-probability.
+  # One of "flow_sde", "flow_cps", "flow_noise".
+  noise_method: "flow_sde"
+  noise_level: 0.5
+  noise_anneal: False
+  noise_params: [0.7, 0.3, 400]
+  # Score every denoising step (True) or a single sampled one (False).
+  joint_logprob: False
+  # Never pick the final, near-deterministic step as the scored transition.
+  ignore_last: False
+
+  # Value head input: mean-pooled DiT suffix (default) or the VLM prefix.
+  value_after_vlm: False
+  chunk_critic_input: False
+  detach_critic_input: True
+
+  # Debug only: build the architecture from config.json without weights.
+  random_init: False

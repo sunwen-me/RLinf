@@ -30,6 +30,7 @@ RLinf is a flexible and scalable open-source RL infrastructure designed for Embo
 
 
 ## What's NEW!
+- [2026/08] 🔥 RLinf supports reinforcement learning fine-tuning for Xiaomi-Robotics-1 (XR-1) on RoboCasa. Doc: [RL on Xiaomi-Robotics-1 (XR-1)](https://rlinf.readthedocs.io/en/latest/rst_source/examples/embodied/xr1.html).
 - [2026/08] 🔥 RLinf integrates Diffusion-NFT for SD3 and Wan2.2 video generation models. Doc: [RL for Video Generation Models](docs/source-en/rst_source/examples/video_models.rst).
 - [2026/08] 🔥 RLinf officially supports three more accelerators: Moore Threads (MUSA), Huawei Ascend (CANN), and AMD (ROCm). Docs: [Moore Threads MUSA](https://rlinf.readthedocs.io/en/latest/rst_source/guides/moore_threads_musa.html), [Ascend CANN](https://rlinf.readthedocs.io/en/latest/rst_source/guides/ascend_cann.html), [AMD ROCm](https://rlinf.readthedocs.io/en/latest/rst_source/guides/amd_rocm.html).
 - [2026/08] 🔥 RLinf supports GRPO training for Moonlight-16B-A3B (DeepSeek-V3 MLA + MoE). Doc: [Moonlight-16B GRPO](https://rlinf.readthedocs.io/en/latest/rst_source/examples/agentic/math_reasoning/moonlight.html).
@@ -169,6 +170,7 @@ RLinf supports SFT, simulation RL, and real-world RL for World Action Models (WA
             <li><a href="https://rlinf.readthedocs.io/en/latest/rst_source/examples/embodied/abot_m0.html">ABot-M0</a> ✅</li>
             <li><a href="https://rlinf.readthedocs.io/en/latest/rst_source/examples/embodied/evo1.html">Evo-1</a> ✅</li>
             <li><a href="https://rlinf.readthedocs.io/en/latest/rst_source/examples/embodied/molmoact2.html">MolmoAct2</a> ✅</li>
+            <li><a href="https://rlinf.readthedocs.io/en/latest/rst_source/examples/embodied/xr1.html">Xiaomi-Robotics-1 (XR-1)</a> ✅</li>
           </ul>
           <li><b>VLM</b></li>
           <ul>

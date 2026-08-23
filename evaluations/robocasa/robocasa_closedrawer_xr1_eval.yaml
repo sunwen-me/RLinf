@@ -1,0 +1,88 @@
+defaults:
+  - env/robocasa_closedrawer@env.eval
+  - model/xr1@rollout.model
+  - _self_
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    env,rollout: all
+
+runner:
+  task_type: embodied_eval
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "robocasa_closedrawer_xr1_eval"
+    logger_backends: ["tensorboard"] # wandb, swanlab
+
+  max_epochs: 1
+  max_steps: -1
+
+  only_eval: True
+  val_check_interval: -1
+  save_interval: -1
+
+  resume_dir: null # Unused in eval-only mode; set `ckpt_path` instead.
+  # Optional: state dict loaded on top of `rollout.model.model_path` after the
+  # model is built. Use it to score an RL checkpoint produced by training:
+  # `checkpoints/global_step_<N>/actor/model_state_dict/full_weights.pt`.
+  # Leave null to evaluate the released SFT weights.
+  ckpt_path: null
+
+env:
+  group_name: "EnvGroup"
+
+  # Override the defaults in env/robocasa_closedrawer: XR-1 consumes three
+  # 256x256 views, the 7D end-effector action space, and a 32D state vector
+  # whose last seven entries are the raw arm joint positions.
+  eval:
+    rollout_epoch: 1
+    # Must be divisible by the number of env ranks in `component_placement`.
+    total_num_envs: 16
+    auto_reset: True
+    ignore_terminations: True
+    # RoboCasa allows CloseDrawer 500 steps; 300 is enough for XR-1 and keeps
+    # the numbers comparable with the training-time evaluation.
+    max_episode_steps: 300
+    max_steps_per_rollout_epoch: 300
+    # Deterministic, non-overlapping initial states so repeated runs and
+    # different checkpoints are scored on the same episodes.
+    use_fixed_reset_state_ids: True
+    use_ordered_reset_state_ids: True
+    is_eval: True
+    action_space: 7d
+    state_space: 32d
+    image_space: 3views
+    include_joint_state: True
+    init_params:
+      camera_heights: 256
+      camera_widths: 256
+    video_cfg:
+      save_video: True
+      info_on_video: True
+      video_base_dir: ${runner.logger.log_path}/video/eval
+
+rollout:
+  group_name: "RolloutGroup"
+  generation_backend: "huggingface"
+  recompute_logprobs: False
+  enable_offload: False
+  pipeline_stage_num: 1
+
+  # Override the defaults in model/xr1. In eval-only mode the env and rollout
+  # workers read `rollout.model`, so this block carries the full model config.
+  model:
+    model_path: "/path/to/Xiaomi-Robotics-1-RoboCasa"
+    add_value_head: False
+    # Selects the RoboCasa action-space mapping in
+    # rlinf/envs/action_utils.py::prepare_actions_for_robocasa.
+    policy_setup: ${env.eval.action_space}
