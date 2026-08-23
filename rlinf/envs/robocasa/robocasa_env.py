@@ -22,6 +22,8 @@ from omegaconf import OmegaConf
 from rlinf.envs.robocasa.utils import (
     OBS_KEY_CAMERA_NAME_MAPPING,
     OBS_KEY_ROBOCASA_IMAGE_MAPPING,
+    ROBOCASA_BASE_STATE_DIM,
+    ROBOCASA_JOINT_STATE_DIM,
     get_image_space,
 )
 from rlinf.envs.robocasa.venv import RobocasaSubprocEnv
@@ -43,6 +45,12 @@ class RobocasaEnv(gym.Env):
         self.group_size = self.cfg.group_size
         self.num_group = self.num_envs // self.group_size
         self.use_fixed_reset_state_ids = cfg.get("use_fixed_reset_state_ids", False)
+        # Append ``robot0_joint_pos`` (7 arm joints) at indices 25:32 of the state
+        # vector. Opt-in so that models slicing the state by index keep working.
+        self.include_joint_state = cfg.get("include_joint_state", False)
+        self.state_dim = ROBOCASA_BASE_STATE_DIM + (
+            ROBOCASA_JOINT_STATE_DIM if self.include_joint_state else 0
+        )
 
         self.ignore_terminations = cfg.ignore_terminations
         self.auto_reset = cfg.auto_reset
@@ -137,6 +145,7 @@ class RobocasaEnv(gym.Env):
             camera_widths = self.cfg.init_params.camera_widths
             camera_heights = self.cfg.init_params.camera_heights
             robot_name = self.cfg.robot_name
+            include_joint_state = self.include_joint_state
 
             def env_fn(
                 task=task_name,
@@ -144,6 +153,7 @@ class RobocasaEnv(gym.Env):
                 width=camera_widths,
                 height=camera_heights,
                 robot=robot_name,
+                joint_state=include_joint_state,
             ):
                 """Factory function to create a robosuite environment in subprocess."""
                 import robosuite
@@ -171,6 +181,19 @@ class RobocasaEnv(gym.Env):
                     translucent_robot=False,
                     render_camera="robot0_agentview_center",  # Use same camera as observation
                 )
+                if joint_state:
+                    # Robosuite builds ``robot0_joint_pos`` as an *inactive*
+                    # observable ("we don't want to include the direct joint pos
+                    # sensor outputs"), so the raw joint angles are computed but
+                    # never returned in the observation dict. Activating it here
+                    # is enough: observables are created once in the env
+                    # constructor and ``_reset_observables`` only refreshes their
+                    # sensor callbacks, so the flag survives every reset.
+                    env.modify_observable(
+                        observable_name="robot0_joint_pos",
+                        attribute="active",
+                        modifier=True,
+                    )
                 return env
 
             env_fns.append(env_fn)
@@ -243,6 +266,10 @@ class RobocasaEnv(gym.Env):
         [14:18] robot0_base_to_eef_quat (w, x, y, z) - 4D
         [18:21] robot0_base_pos - (x, y, z) 3D
         [21:25] robot0_base_quat - (w, x, y, z) 4D
+
+        When ``include_joint_state`` is set in the env config, seven raw arm joint
+        positions are appended:
+        [25:32] robot0_joint_pos - 7D
         """
         left_images = []
         wrist_images = []
@@ -268,18 +295,38 @@ class RobocasaEnv(gym.Env):
             wrist_images.append(wrist_img)
             right_images.append(right_img)
 
-            # Construct full 25D state matching Pi0's training format
-            state_25d = np.zeros(25, dtype=np.float32)
-            state_25d[0:3] = obs[env_id]["robot0_eef_pos"]
-            state_25d[3:7] = obs[env_id]["robot0_eef_quat"]
-            state_25d[7:9] = obs[env_id]["robot0_gripper_qpos"]
-            state_25d[9:11] = obs[env_id]["robot0_gripper_qvel"]
-            state_25d[11:14] = obs[env_id]["robot0_base_to_eef_pos"]
-            state_25d[14:18] = obs[env_id]["robot0_base_to_eef_quat"]
-            state_25d[18:21] = obs[env_id]["robot0_base_pos"]
-            state_25d[21:25] = obs[env_id]["robot0_base_quat"]
+            # Construct the state vector matching Pi0's training format. The first
+            # 25 dims are always present; joint positions are optional.
+            state = np.zeros(self.state_dim, dtype=np.float32)
+            state[0:3] = obs[env_id]["robot0_eef_pos"]
+            state[3:7] = obs[env_id]["robot0_eef_quat"]
+            state[7:9] = obs[env_id]["robot0_gripper_qpos"]
+            state[9:11] = obs[env_id]["robot0_gripper_qvel"]
+            state[11:14] = obs[env_id]["robot0_base_to_eef_pos"]
+            state[14:18] = obs[env_id]["robot0_base_to_eef_quat"]
+            state[18:21] = obs[env_id]["robot0_base_pos"]
+            state[21:25] = obs[env_id]["robot0_base_quat"]
+            if self.include_joint_state:
+                joint_pos = obs[env_id].get("robot0_joint_pos")
+                if joint_pos is None:
+                    raise KeyError(
+                        "`include_joint_state` is enabled but the robocasa observation "
+                        "has no `robot0_joint_pos` entry. Available keys: "
+                        f"{sorted(obs[env_id].keys())}"
+                    )
+                joint_pos = np.asarray(joint_pos).reshape(-1)
+                if joint_pos.shape[0] != ROBOCASA_JOINT_STATE_DIM:
+                    raise ValueError(
+                        f"Expected {ROBOCASA_JOINT_STATE_DIM} arm joint positions, got "
+                        f"{joint_pos.shape[0]}. Check the robot model "
+                        f"({self.cfg.robot_name})."
+                    )
+                state[
+                    ROBOCASA_BASE_STATE_DIM : ROBOCASA_BASE_STATE_DIM
+                    + ROBOCASA_JOINT_STATE_DIM
+                ] = joint_pos
 
-            states.append(state_25d)
+            states.append(state)
 
         return {
             "robot0_agentview_left_image": np.array(left_images),

@@ -27,7 +27,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 # STATE #####
 
-ROBOCASA_STATES = {  # for daixianjie/robocasa_lerobot dataset
+ROBOCASA_BASE_STATES = {  # for daixianjie/robocasa_lerobot dataset
     "robot0_eef_pos": np.arange(0, 3),
     "robot0_eef_quat": np.arange(3, 7),
     "robot0_gripper_qpos": np.arange(7, 9),
@@ -38,6 +38,25 @@ ROBOCASA_STATES = {  # for daixianjie/robocasa_lerobot dataset
     "robot0_base_quat": np.arange(21, 25),
 }
 
+# Width of the always-present end-effector state block.
+ROBOCASA_BASE_STATE_DIM = 25
+
+# Number of raw arm joint positions appended after the base block. Robosuite's
+# ``robot0_joint_pos`` observable reports ``robot_model.joints`` (arm joints only,
+# base/torso joints live in ``all_joints``), which is 7 for every Panda variant.
+ROBOCASA_JOINT_STATE_DIM = 7
+
+# Optional state blocks appended *after* index 25 so that the layout of the base
+# block never shifts. Models that slice the state by index (e.g. OpenPI recipes
+# built on the "16d"/"25d" presets) are therefore unaffected by enabling them.
+ROBOCASA_EXTRA_STATES = {
+    # Only emitted when the env config sets ``include_joint_state: True``; see
+    # ``RobocasaEnv._extract_image_and_state``.
+    "robot0_joint_pos": np.arange(25, 32),
+}
+
+ROBOCASA_STATES = {**ROBOCASA_BASE_STATES, **ROBOCASA_EXTRA_STATES}
+
 STATE_SPACE_STR_MAPPING = {
     # NOTE: see https://github.com/robocasa/robocasa/issues/11, in Robocasa paper the authors use 16d state as input.
     "16d": [
@@ -47,7 +66,9 @@ STATE_SPACE_STR_MAPPING = {
         "robot0_base_quat",  # 21-25， 4
         "robot0_gripper_qpos",  # 7-9， 2
     ],  # add up to 16
-    "25d": list(ROBOCASA_STATES.keys()),  # add up to 25
+    "25d": list(ROBOCASA_BASE_STATES.keys()),  # add up to 25
+    # Requires ``include_joint_state: True`` in the env config.
+    "32d": list(ROBOCASA_STATES.keys()),  # add up to 32
 }
 
 
@@ -156,6 +177,11 @@ ROBOCASA_ACTIONS = {  # for daixianjie/robocasa_lerobot dataset
     ),  # NOTE: https://github.com/robocasa/robocasa/issues/141
 }
 
+# Padding used for the action dimensions a model does not predict (see
+# ``prepare_actions_for_robocasa``). The trailing ``-1.0`` is ``base_mode``:
+# robosuite's ``HybridMobileBase.set_goal`` only tests ``all_action[-1] > 0``, so
+# ``-1`` (robosuite's own ``create_action_vector`` default) and the ``0`` used by
+# some upstream VLA eval scripts select the same arm-mode branch.
 ROBOCASA_DEFAULT_ACTION = np.array(
     [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0]
 )
