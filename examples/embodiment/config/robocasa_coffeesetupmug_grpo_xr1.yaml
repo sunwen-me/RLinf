@@ -1,6 +1,6 @@
 defaults:
-  - env/robocasa_closedrawer@env.train
-  - env/robocasa_closedrawer@env.eval
+  - env/robocasa_coffeesetupmug@env.train
+  - env/robocasa_coffeesetupmug@env.eval
   - model/xr1@actor.model
   - hybrid_engines/fsdp@actor.fsdp_config
   - weight_syncer/patch_syncer@weight_syncer
@@ -23,7 +23,7 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "robocasa_closedrawer_grpo_xr1"
+    experiment_name: "robocasa_coffeesetupmug_grpo_xr1"
     logger_backends: ["tensorboard"] # wandb, swanlab
 
   max_epochs: 1000
@@ -69,19 +69,14 @@ env:
   group_name: "EnvGroup"
   enable_offload: False
 
-  # Override the defaults in env/robocasa_closedrawer: XR-1 consumes three
+  # Override the defaults in env/robocasa_coffeesetupmug: XR-1 consumes three
   # 256x256 views, the 7D end-effector action space, and a 32D state vector
   # whose last seven entries are the raw arm joint positions.
-  #
-  # The horizon is 200 rather than the 300 of env/robocasa_closedrawer (which
-  # the OpenPI recipe uses): the released XR-1 checkpoint closes the drawer in
-  # every 300-step episode, and a group whose episodes all succeed has an
-  # identically zero GRPO advantage.
   train:
     rollout_epoch: 8
     total_num_envs: 64
-    max_episode_steps: 200
-    max_steps_per_rollout_epoch: 200
+    max_episode_steps: 500
+    max_steps_per_rollout_epoch: 500
     group_size: ${algorithm.group_size}
     reward_coef: ${algorithm.reward_coef}
     action_space: 7d
@@ -101,8 +96,8 @@ env:
     total_num_envs: 16
     auto_reset: True
     ignore_terminations: True
-    max_episode_steps: 200
-    max_steps_per_rollout_epoch: 200
+    max_episode_steps: 500
+    max_steps_per_rollout_epoch: 500
     use_fixed_reset_state_ids: True
     use_ordered_reset_state_ids: True
     is_eval: True
