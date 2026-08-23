@@ -31,7 +31,9 @@ runner:
 
   only_eval: False
   val_check_interval: 20
-  save_interval: 20
+  # A consolidated XR-1 state dict is ~23 GB, so checkpointing is off by
+  # default; set a positive number of steps to keep intermediate weights.
+  save_interval: -1
 
   resume_dir: null # Optional: path to a saved checkpoint directory, such as 'checkpoints/global_step_10'. If not None, it will be used to resume training.
   ckpt_path: null  # Optional: path to a .pt checkpoint. If not None, it will be loaded after the model is instantiated (for evaluation).
