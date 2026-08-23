@@ -225,6 +225,37 @@ def get_action_ids(action_space: list) -> list:
     return all_action_ids
 
 
+# TASK ASSIGNMENT ###########
+def assign_task_ids(
+    num_envs: int,
+    num_tasks: int,
+    group_size: int = 1,
+    seed_offset: int = 0,
+) -> np.ndarray:
+    """Map every parallel environment to one entry of the configured task list.
+
+    Task ids advance once per rollout group instead of once per environment:
+    group-relative algorithms average the reward of ``group_size`` consecutive
+    environments (``rewards.view(-1, group_size)`` in
+    ``compute_grpo_advantages``), so a group that spanned several tasks
+    would compare episodes of unrelated difficulty against a shared baseline.
+    Groups are numbered globally so the task list is spread across env ranks
+    rather than restarted on each of them.
+
+    Args:
+        num_envs: Number of environments owned by this rank.
+        num_tasks: Length of the configured ``task_names`` list.
+        group_size: Number of environments that share one advantage baseline.
+        seed_offset: Rank index of this env worker, as passed by the env worker.
+
+    Returns:
+        Task index per local environment, shape ``[num_envs]``.
+    """
+    local_env_ids = np.arange(num_envs, dtype=np.int64)
+    global_group_ids = (seed_offset * num_envs + local_env_ids) // max(group_size, 1)
+    return (global_group_ids % num_tasks).astype(np.int64)
+
+
 # VIDEO ###########
 def tile_images(
     images: list[Union[np.ndarray, torch.Tensor]], nrows: int = 1

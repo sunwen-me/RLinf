@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import copy
+import logging
 from typing import Optional, Union
 
 import gymnasium as gym
@@ -24,6 +25,7 @@ from rlinf.envs.robocasa.utils import (
     OBS_KEY_ROBOCASA_IMAGE_MAPPING,
     ROBOCASA_BASE_STATE_DIM,
     ROBOCASA_JOINT_STATE_DIM,
+    assign_task_ids,
     get_image_space,
 )
 from rlinf.envs.robocasa.venv import RobocasaSubprocEnv
@@ -118,19 +120,41 @@ class RobocasaEnv(gym.Env):
         """Initialize robocasa environments using subprocess isolation."""
         import robocasa  # noqa: F401 Robocasa must be imported to register envs
 
-        self.task_ids = []
-
-        # Determine task IDs for each environment
-        for env_id in range(self.num_envs):
-            task_idx = env_id % self.num_tasks
-            self.task_ids.append(task_idx)
-        self.task_ids = np.array(self.task_ids)
+        # One task per rollout group, numbered across all env ranks.
+        self.task_ids = assign_task_ids(
+            num_envs=self.num_envs,
+            num_tasks=self.num_tasks,
+            group_size=self.group_size,
+            seed_offset=self.seed_offset,
+        )
+        self._warn_on_partial_task_coverage()
 
         # Create environment factory functions for subprocess isolation
         env_fns = self.get_env_fns()
 
         # Use subprocess vector environment to avoid OpenGL context sharing
         self.env = RobocasaSubprocEnv(env_fns)
+
+    def _warn_on_partial_task_coverage(self):
+        """Warn when the env count cannot cover ``task_names`` evenly.
+
+        Every rollout group runs a single task, so a multi-task run needs at
+        least ``group_size`` environments per task -- and a multiple of it -- for
+        all tasks to appear equally often.
+        """
+        if self.num_tasks == 1 or self.seed_offset != 0:
+            return
+        num_global_groups = (
+            self.total_num_processes * self.num_envs // max(self.group_size, 1)
+        )
+        if num_global_groups % self.num_tasks != 0:
+            logging.warning(
+                f"RoboCasa runs {self.num_tasks} tasks over {num_global_groups} "
+                f"rollout groups (total_num_envs / group_size), so the tasks are "
+                f"sampled unevenly. Set total_num_envs to a multiple of "
+                f"group_size * len(task_names) = "
+                f"{self.group_size * self.num_tasks} for balanced coverage."
+            )
 
     def get_env_fns(self):
         """Create environment factory functions for each parallel environment."""
