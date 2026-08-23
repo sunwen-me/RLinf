@@ -114,65 +114,67 @@ RoboCasa 为该任务本身设定的时域，配方不做改动；只有 ``Close
    无法在 reset 时更换场景，因此同一组内的 episode 是同一任务的不同厨房布局。
 
 时域能否给 GRPO 留出空间取决于权重本身。训练时 episode 一旦成功就会终止，因此一条轨迹的
-得分实际上等价于“该 episode 是否在 ``max_episode_steps`` 内成功”；而 GRPO 会减去组均值：
-组内全部成功——或全部失败——的优势恒为零，也就不产生梯度。用上面的评测配置为已发布的 SFT
-权重打分（每个任务 8 个固定种子 episode，各只采样一次；动作专家本身是随机采样的，因此相近
-的数值之间属于噪声范围）：
+得分实际上等价于“该 episode 是否在 ``max_episode_steps`` 内成功”——即 ``success_once``，
+而不是 ``success_at_end``（评测配置使用 ``ignore_terminations: True``，成功后仍会继续运行，
+状态可能被破坏）。GRPO 随后会减去组均值：组内全部成功——或全部失败——的优势恒为零，也就
+不产生梯度。下表是用上面的评测配置对已发布 SFT 权重做的两次独立测量，每次都是同样 8 个固定
+种子 episode（动作专家本身随机采样，8 个 episode 在两次之间最多相差 0.25——请把两列当作区间
+而不是精确值）：
 
 .. list-table::
    :header-rows: 1
-   :widths: 28 20 18 34
+   :widths: 28 18 20 34
 
    * - 任务
      - ``max_episode_steps``
-     - ``success_once``
+     - 两次 ``success_once``
      - 更短时域的探测结果
    * - ``CloseDrawer``
      - 200
-     - 1.00
+     - 1.00 / 0.625
      - 150 → 0.00、100 → 0.00
    * - ``OpenDrawer``
      - 500
-     - 1.00
+     - 1.00 / 0.75
      - 350 → 0.875、200 → 0.375
    * - ``CloseDoubleDoor``
      - 500
-     - 1.00
+     - 1.00 / 0.75
      - 350 → 0.00、200 → 0.00
    * - ``TurnOnStove``
      - 500
-     - 0.50
+     - 0.50 / 0.50
      - 200 → 0.625
    * - ``TurnOffSinkFaucet``
      - 500
-     - 0.75
+     - 0.75 / 0.875
      - 200 → 0.875
    * - ``TurnSinkSpout``
      - 500
-     - 0.875
+     - 0.875 / 0.625
      - 200 → 0.625
    * - ``CoffeeSetupMug``
      - 500
-     - 0.75
+     - 0.75 / 0.50
      - 200 → 0.00
    * - ``PnPCabToCounter``
      - 500
-     - 0.625
+     - 0.625 / 0.875
      - 200 → 0.00
    * - ``PnPCounterToSink``
      - 500
-     - 0.25
+     - 0.25 / 0.25
      - 200 → 0.00
 
-9 个任务中有 6 个在原时域下仍有区分度。``CloseDrawer``、``OpenDrawer`` 和
-``CloseDoubleDoor`` 出现了饱和；在 ``OpenDrawer`` + ``CloseDoubleDoor`` 上跑一步 GRPO 就能
-看到代价：``advantages_max``、``advantages_mean``、``advantages_min`` 与 ``actor/grad_norm``
-全为 0，而同样的一步在 ``TurnOnStove`` 上得到 ``advantages_max`` 0.87、``actor/grad_norm``
-133.5。首先可以尝试缩短 ``max_episode_steps``——350 步下 ``OpenDrawer`` 为 0.875；但成功率
-不是平滑下降而是崖式跳变：``CloseDoubleDoor`` 从 500 步的 1.00 直接降到 350 步的 0.00，
-``CloseDrawer`` 从 200 步的 1.00 降到 150 步的 0.00，而 200 步对咖啡和抓放类任务已经太短。
-``CloseDrawer`` 在配方的 200 步下本次测得 1.00，而更早一次测得 0.625——这就是处在崖边的
-表现：改动任何时域后请重新测量，并尽量多重复几次而不是只采一个样本。
+``CloseDrawer`` 是唯一在 RoboCasa 原时域下每个 episode 都成功的任务——300 步与 500 步
+均为 1.00，因此配方把它缩短到 200 步，两次测量在该时域下分别为 1.00 与 0.625。``OpenDrawer`` 与 ``CloseDoubleDoor`` 处于区间上端，一组 4 个
+episode 全部成功的情况很常见：那次恰好抽到这两个任务的单步 GRPO 运行中，两组都是 4/4，
+``advantages_max``、``advantages_mean``、``advantages_min`` 与 ``actor/grad_norm`` 全为 0；
+而同样一步在 ``TurnOnStove`` 上得到 ``advantages_max`` 0.87、``actor/grad_norm`` 133.5。
+首先可以缩短 ``max_episode_steps``——350 步下 ``OpenDrawer`` 为 0.875；但成功率不是平滑
+下降而是崖式跳变：``CloseDoubleDoor`` 从 500 步的 1.00 直接降到 350 步的 0.00，
+``CloseDrawer`` 从 200 步的 1.00 降到 150 步的 0.00，而 200 步下咖啡和抓放类任务成功率为 0。
+改动任何时域后都要重新测量；若该数值重要，请用多于 8 个 episode。
 
 观测与动作
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

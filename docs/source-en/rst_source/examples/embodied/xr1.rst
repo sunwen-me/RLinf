@@ -118,69 +118,72 @@ the released checkpoint closes the drawer in every 300-step episode.
 
 Whether a horizon leaves room for GRPO depends on the checkpoint. A training episode ends
 as soon as the task succeeds, so a trajectory's score is effectively "did this episode
-succeed within ``max_episode_steps``", and GRPO subtracts the group mean: a group whose
-episodes all succeed — or all fail — has an identically zero advantage and contributes no
-gradient. The released SFT checkpoint, scored with the evaluation configs above (eight
-fixed-seed episodes per task, one sample each; the action expert samples stochastically, so
-nearby values are within noise of one another):
+succeed within ``max_episode_steps``" — ``success_once``, not ``success_at_end``, which the
+evaluation configs let drift because they run with ``ignore_terminations: True``. GRPO then
+subtracts the group mean, so a group whose episodes all succeed — or all fail — has an
+identically zero advantage and contributes no gradient. The released SFT checkpoint scored
+with the evaluation configs above, two independent sweeps of the same eight fixed-seed
+episodes (the action expert samples stochastically, and eight episodes swing by up to 0.25
+between sweeps — read the columns as a range, not a measurement):
 
 .. list-table::
    :header-rows: 1
-   :widths: 28 20 18 34
+   :widths: 28 18 20 34
 
    * - Task
      - ``max_episode_steps``
-     - ``success_once``
+     - ``success_once``, two sweeps
      - Shorter horizons probed
    * - ``CloseDrawer``
      - 200
-     - 1.00
+     - 1.00 / 0.625
      - 150 → 0.00, 100 → 0.00
    * - ``OpenDrawer``
      - 500
-     - 1.00
+     - 1.00 / 0.75
      - 350 → 0.875, 200 → 0.375
    * - ``CloseDoubleDoor``
      - 500
-     - 1.00
+     - 1.00 / 0.75
      - 350 → 0.00, 200 → 0.00
    * - ``TurnOnStove``
      - 500
-     - 0.50
+     - 0.50 / 0.50
      - 200 → 0.625
    * - ``TurnOffSinkFaucet``
      - 500
-     - 0.75
+     - 0.75 / 0.875
      - 200 → 0.875
    * - ``TurnSinkSpout``
      - 500
-     - 0.875
+     - 0.875 / 0.625
      - 200 → 0.625
    * - ``CoffeeSetupMug``
      - 500
-     - 0.75
+     - 0.75 / 0.50
      - 200 → 0.00
    * - ``PnPCabToCounter``
      - 500
-     - 0.625
+     - 0.625 / 0.875
      - 200 → 0.00
    * - ``PnPCounterToSink``
      - 500
-     - 0.25
+     - 0.25 / 0.25
      - 200 → 0.00
 
-Six of the nine tasks leave spread at the shipped horizon. ``CloseDrawer``, ``OpenDrawer``
-and ``CloseDoubleDoor`` came out saturated, and a one-step GRPO run over
-``OpenDrawer`` + ``CloseDoubleDoor`` shows what that costs: ``advantages_max``,
-``advantages_mean``, ``advantages_min`` and ``actor/grad_norm`` were all exactly 0, while
-the same step on ``TurnOnStove`` reached ``advantages_max`` 0.87 and ``actor/grad_norm``
-133.5. Shortening ``max_episode_steps`` is the first thing to try — 350 steps put
-``OpenDrawer`` at 0.875 — but success falls off a cliff instead of degrading smoothly:
-``CloseDoubleDoor`` goes from 1.00 to 0.00 between 500 and 350 steps, ``CloseDrawer`` from
-1.00 to 0.00 between 200 and 150, and 200 steps is already too short for the coffee and
-pick-and-place tasks. ``CloseDrawer`` at its shipped 200 scored 1.00 in this sweep and
-0.625 in an earlier one, which is what sitting on that edge looks like: re-measure any
-value you change, and prefer several samples over one.
+``CloseDrawer`` is the one task the checkpoint solved in every episode at RoboCasa's own
+horizon — 1.00 at both 300 and 500 steps — which is why its recipe shortens it to 200,
+where the two sweeps read 1.00 and 0.625. ``OpenDrawer`` and
+``CloseDoubleDoor`` sit at the top of the range, and a group of four all-successful
+episodes is common there: the one-step GRPO run that happened to draw those two tasks
+scored 4/4 in both groups and reported ``advantages_max``, ``advantages_mean``,
+``advantages_min`` and ``actor/grad_norm`` all exactly 0, while the same step on
+``TurnOnStove`` reached ``advantages_max`` 0.87 and ``actor/grad_norm`` 133.5. Shortening
+``max_episode_steps`` is the first lever — 350 steps put ``OpenDrawer`` at 0.875 — but
+success falls off a cliff rather than degrading smoothly: ``CloseDoubleDoor`` goes from
+1.00 to 0.00 between 500 and 350 steps, ``CloseDrawer`` from 1.00 to 0.00 between 200 and
+150, and at 200 steps the coffee and pick-and-place tasks reach 0. Re-measure whatever you
+change, with more than eight episodes if the value matters.
 
 Observation and Action
 ~~~~~~~~~~~~~~~~~~~~~~
