@@ -97,7 +97,7 @@ NO_ROOT=0
 NO_INSTALL_RLINF_CMD="--no-install-project"
 SUPPORTED_TARGETS=("embodied" "agentic" "docs")
 SUPPORTED_ENGINES=("sglang" "vllm")
-SUPPORTED_MODELS=("openvla" "openvla-oft" "openpi" "gr00t" "gr00t_n1d6" "gr00t_n1d7" "dexbotic" "starvla" "lingbotvla" "dreamzero" "qwen3_vl" "abot_m0" "molmoact2" "evo1" "diffusion")
+SUPPORTED_MODELS=("openvla" "openvla-oft" "openpi" "gr00t" "gr00t_n1d6" "gr00t_n1d7" "dexbotic" "starvla" "lingbotvla" "dreamzero" "qwen3_vl" "abot_m0" "molmoact2" "evo1" "diffusion" "xr1")
 SUPPORTED_ENVS=("behavior" "maniskill_libero" "libero" "metaworld" "calvin" "isaaclab" "robocasa" "robocasa365" "franka" "franka-dexhand" "franka-franky" "frankasim" "robotwin" "habitat" "opensora" "wan" "genesis" "xsquare_turtle2" "liberopro" "liberoplus" "roboverse" "embodichain" "d4rl" "dosw1" "gim_arm" "dummy" "polaris")
 
 #=======================Utility Functions=======================
@@ -2126,6 +2126,31 @@ install_lingbot_vla_model() {
     uv pip uninstall pynvml || true
 }
 
+install_xr1_model() {
+    # Xiaomi-Robotics-1 (XR-1) is a Qwen3-VL + DiT mixture-of-transformers VLA.
+    # The checkpoint ships its own modelling code, which RLinf loads through
+    # `trust_remote_code`, so there is no upstream repo to clone or install.
+    create_and_sync_venv
+    install_common_embodied_deps
+
+    case "$ENV_NAME" in
+        robocasa)
+            install_robocasa_env
+            ;;
+        *)
+            echo "Environment '$ENV_NAME' is not supported for XR-1 model." >&2
+            exit 1
+            ;;
+    esac
+
+    # Pins transformers to the exact version XR-1 was released against; must run
+    # after the env install so nothing downgrades it again.
+    uv pip install -r "$SCRIPT_DIR/embodied/models/xr1.txt"
+
+    install_flash_attn
+    uv pip uninstall pynvml || true
+}
+
 install_abot_m0_model() {
     create_and_sync_venv
     install_common_embodied_deps
@@ -3083,6 +3108,9 @@ main() {
                     ;;
                 lingbotvla)                  
                     install_lingbot_vla_model 
+                    ;;
+                xr1)
+                    install_xr1_model
                     ;;
                 abot_m0)
                     install_abot_m0_model

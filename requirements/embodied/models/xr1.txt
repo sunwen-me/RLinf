@@ -1,0 +1,18 @@
+## Xiaomi-Robotics-1 (XR-1) runtime pins.
+##
+## XR-1 ships its modelling code inside the HuggingFace checkpoint and RLinf
+## loads it through ``trust_remote_code``, so there is no upstream package to
+## install. The remote code only imports ``torch``, ``numpy`` and
+## ``transformers``; everything else already comes from the base dependencies,
+## the ``embodied`` extra and requirements/embodied/envs/common.txt.
+##
+## transformers 4.57.1 is the version upstream pins
+## (Xiaomi-Robotics-1/xr1/assets/requirements.txt) and the first release that
+## carries Qwen3-VL, which the XR-1 VLM subclasses. Staying on the exact upstream
+## pin keeps the remote code's imports stable
+## (``transformers.masking_utils.create_causal_mask``,
+## ``transformers.modeling_layers.GradientCheckpointingLayer``).
+transformers==4.57.1
+## transformers 4.57.x resolves tokenizers >=0.22,<0.23. Assert it explicitly so
+## a later resolve in the same venv cannot drift the pair out of sync.
+tokenizers>=0.22,<0.23
