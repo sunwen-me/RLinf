@@ -377,6 +377,50 @@ keep the env spaces aligned with the checkpoint:
    configs also write to ``<runner.logger.log_path>/video``; turn ``save_video`` off when
    space is tight.
 
+RL hyper-parameters
+~~~~~~~~~~~~~~~~~~~
+
+XR-1's action head is a flow-matching sampler, so its RL hyper-parameters are taken from
+the recipes this repository already ships for that model class
+(``libero_spatial_grpo_evo1.yaml``, ``robotwin_*_grpo_lingbotvla.yaml``,
+``libero_spatial_ppo_dexbotic_pi0.yaml``) rather than invented separately:
+
+.. code:: yaml
+
+   algorithm:
+     logprob_type: token_level   # per-dim ratio (the executed 10x7 dims)
+     filter_rewards: True        # drop all-success / all-fail groups
+     rewards_lower_bound: 0.1
+     rewards_upper_bound: 0.9
+     clip_ratio_low: 0.2
+     clip_ratio_high: 0.28       # clip-higher
+     group_size: 8
+     update_epoch: 2
+
+   actor:
+     optim:
+       lr: 5.0e-6                # same as openpi / gr00t / dexbotic / evo1
+
+``logprob_type`` is the one that matters most. ``chunk_level`` sums
+``num_action_chunks x action_dim`` (10x7=70) Gaussian logprobs into a single number, so the
+small numerical difference between the rollout and training passes reaches the PPO ratio
+amplified by :math:`\sqrt{70}`. Measured on frozen actor weights (``actor/lr=0`` during
+``critic_warmup_steps``, where both sides are provably the same weights and the true ratio
+is exactly 1), ``actor/ratio_abs`` is 0.108 -- 54% of the 0.2 clip range -- with
+``actor/clip_fraction`` between 6.7% and 10.0%. The clip fires on numerical noise before
+the policy has moved at all. ``token_level`` makes every dimension its own ratio, which
+leaves 0.013 of the same noise.
+``tests/unit_tests/test_embodied_logprob_granularity.py`` pins that
+:math:`\sqrt{\text{dims}}` relation as a contract test; Evo-1 (14x7 dims) and LingbotVLA
+(50 action chunks) pick ``token_level`` for the same reason.
+
+.. note::
+
+   ``entropy_bonus`` has to stay 0: with ``noise_method: "flow_sde"`` the XR-1 action head
+   returns an all-zero entropy (see ``get_log_prob_value`` in ``xr1_action_model.py``), the
+   same as Evo-1. ``algorithm.kl_beta`` has no effect on the embodied path -- reference
+   logprobs are only computed by the reasoning and Megatron actors.
+
 PPO instead of GRPO
 ~~~~~~~~~~~~~~~~~~~
 

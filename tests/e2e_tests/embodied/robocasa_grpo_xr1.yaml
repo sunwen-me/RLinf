@@ -44,7 +44,15 @@ algorithm:
   reward_coef: 1.0
 
   reward_type: chunk_level
-  logprob_type: chunk_level
+  # token_level: per-dim PPO ratio. chunk_level sums num_action_chunks*action_dim
+  # (10*7=70) Gaussian logprobs into one number, so the rollout-vs-training
+  # logprob noise hits the ratio amplified by sqrt(70): measured at 0.108 on
+  # frozen actor weights, i.e. 54% of the clip range, clipping ~8% of the batch
+  # before the policy has moved at all (see
+  # tests/unit_tests/test_embodied_logprob_granularity.py). Same choice, same
+  # reason as libero_spatial_grpo_evo1.yaml (14*7 dims) and the lingbotvla
+  # configs (50 chunks).
+  logprob_type: token_level
   entropy_type: token_level
 
   update_epoch: 1
@@ -144,7 +152,10 @@ actor:
       joint_logprob: False
 
   optim:
-    lr: 1.0e-5
+    # 5.0e-6 is the flow-matching VLA learning rate across this repo (openpi,
+    # openpi-pi05, gr00t, dexbotic-pi0, evo1); the earlier 1.0e-5 was 2x that
+    # with nothing measured behind it.
+    lr: 5.0e-6
     value_lr: 1.0e-4
     adam_beta1: 0.9
     adam_beta2: 0.95

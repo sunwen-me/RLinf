@@ -360,6 +360,47 @@ XR-1 的建模代码随检查点一起发布，无需额外克隆仓库。请使
    正整数步数即可。环境的视频配置同样会往 ``<runner.logger.log_path>/video`` 写文件，磁盘
    紧张时请关闭 ``save_video``。
 
+RL 超参数
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+XR-1 的动作头是 flow-matching 采样器，所以它的 RL 超参数取自本仓库中同类模型的配方
+（``libero_spatial_grpo_evo1.yaml``、``robotwin_*_grpo_lingbotvla.yaml``、
+``libero_spatial_ppo_dexbotic_pi0.yaml``），而不是另起一套：
+
+.. code:: yaml
+
+   algorithm:
+     logprob_type: token_level   # 逐维 ratio（执行的 10x7 维）
+     filter_rewards: True        # 丢掉全成功/全失败的组
+     rewards_lower_bound: 0.1
+     rewards_upper_bound: 0.9
+     clip_ratio_low: 0.2
+     clip_ratio_high: 0.28       # clip-higher
+     group_size: 8
+     update_epoch: 2
+
+   actor:
+     optim:
+       lr: 5.0e-6                # 与 openpi / gr00t / dexbotic / evo1 一致
+
+``logprob_type`` 是这里最关键的一项。``chunk_level`` 会把
+``num_action_chunks x action_dim``\ （10x7=70）个高斯对数概率求和成一个数，于是
+rollout 与训练两侧那点数值差异会以 :math:`\sqrt{70}` 的倍率放大到 PPO 的 ratio 上。在
+actor 被冻结（``critic_warmup_steps`` 期间 ``actor/lr=0``\ ，两侧权重可证明相同、真实
+ratio 恒为 1）的步骤上实测 ``actor/ratio_abs`` = 0.108，是 0.2 裁剪区间的 54%，
+``actor/clip_fraction`` 6.7%–10.0%——也就是说策略还没动，裁剪就已经在噪声上触发了。
+``token_level`` 让每一维单独构成一个 ratio，同样的噪声只剩 0.013。
+``tests/unit_tests/test_embodied_logprob_granularity.py`` 把这个
+:math:`\sqrt{\text{dims}}` 关系固定成了契约测试；Evo-1（14x7 维）与 LingbotVLA（50 个
+动作块）出于同样的理由选择 ``token_level``。
+
+.. note::
+
+   ``entropy_bonus`` 必须保持 0：``noise_method: "flow_sde"`` 下 XR-1 的动作头返回全零的
+   熵（见 ``xr1_action_model.py`` 中的 ``get_log_prob_value``\ ），Evo-1 同理。
+   ``algorithm.kl_beta`` 在 embodied 路径上不生效——参考模型的 logprob 只在 reasoning 与
+   Megatron 的 actor 里计算。
+
 用 PPO 替代 GRPO
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
