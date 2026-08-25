@@ -24,6 +24,29 @@ from rlinf.utils.metric_utils import (
 from rlinf.utils.utils import masked_mean, masked_mean_ratio
 
 
+def _metrics_mask(values: torch.Tensor, loss_mask: torch.Tensor) -> torch.Tensor:
+    """Expand ``loss_mask`` to the shape of a per-dimension metric tensor.
+
+    ``logprob_type: token_level`` keeps the trailing action dimension on the
+    importance ratio -- ``[bsz, num_chunks, action_dim]`` -- while ``loss_mask``
+    stays ``[bsz, num_chunks, 1]``. Metric numerators broadcast over that
+    dimension, so they must be normalized by the expanded element count.
+    Dividing by ``loss_mask.count_nonzero()`` instead reports every such metric
+    ``action_dim`` times too large, which lets ``clip_fraction`` exceed 1.
+
+    Returns ``loss_mask`` unchanged when no broadcast is in play, so
+    ``chunk_level`` and ``action_level`` are unaffected.
+    """
+    if (
+        values.dim() > 2
+        and loss_mask.dim() == values.dim()
+        and loss_mask.shape[-1] == 1
+        and values.shape[-1] > 1
+    ):
+        return loss_mask.expand_as(values)
+    return loss_mask
+
+
 def compute_decoupled_ppo_actor_loss(
     logprobs: torch.Tensor,
     old_logprobs: torch.Tensor,
@@ -92,7 +115,6 @@ def compute_decoupled_ppo_actor_loss(
         "proximal_logprobs must be float32 to keep numerical stability"
     )
 
-    loss_mask_count = loss_mask.count_nonzero() or 1
     proximal_ratio = torch.where(
         loss_mask, torch.exp(logprobs - proximal_logprobs), 0.0
     )
@@ -118,34 +140,45 @@ def compute_decoupled_ppo_actor_loss(
         if behave_weight_threshold is not None
         else loss_mask
     )
-    behav_mask_count = behav_mask.count_nonzero() or 1
 
     pg_loss = loss_agg_func(pg_loss * behav_weight, behav_mask, loss_mask_ratio)
     if critic_warmup:
         pg_loss = torch.tensor(0.0, device=pg_loss.device)
 
     with torch.no_grad():
+        # Metric denominators only: the numerators broadcast over the trailing
+        # action dim under token_level, so loss_mask_count / behav_mask_count
+        # would inflate every one of these by action_dim. The loss above keeps
+        # using the unexpanded masks and is deliberately left untouched.
+        metrics_mask = _metrics_mask(proximal_ratio, loss_mask)
+        metrics_mask_count = metrics_mask.count_nonzero() or 1
+        behav_metrics_mask = _metrics_mask(proximal_ratio, behav_mask)
+        behav_metrics_count = behav_metrics_mask.count_nonzero() or 1
+
         clip_fraction = (pg_loss1 < pg_loss2).logical_and(
-            loss_mask
-        ).count_nonzero() / loss_mask_count
+            metrics_mask
+        ).count_nonzero() / metrics_mask_count
         dual_clip_fraction = (
-            dual_clip_mask.logical_and(loss_mask).count_nonzero() / loss_mask_count
+            dual_clip_mask.logical_and(metrics_mask).count_nonzero()
+            / metrics_mask_count
         )
         proximal_approx_kl = (
-            -torch.where(loss_mask, logprobs - proximal_logprobs, 0.0).sum()
-            / loss_mask_count
+            -torch.where(metrics_mask, logprobs - proximal_logprobs, 0.0).sum()
+            / metrics_mask_count
         )
         behav_approx_kl = (
-            -torch.where(behav_mask, proximal_logprobs - old_logprobs, 0.0).sum()
-            / behav_mask_count
+            -torch.where(
+                behav_metrics_mask, proximal_logprobs - old_logprobs, 0.0
+            ).sum()
+            / behav_metrics_count
         )
-        behav_clip_fraction = 1.0 - (behav_mask_count / loss_mask_count)
+        behav_clip_fraction = 1.0 - (behav_metrics_count / metrics_mask_count)
 
     metrics_data = {
         "actor/policy_loss": pg_loss.detach(),
-        "actor/proximal_ratio": masked_mean(proximal_ratio.detach(), loss_mask),
+        "actor/proximal_ratio": masked_mean(proximal_ratio.detach(), metrics_mask),
         "actor/clipped_proximal_ratio": masked_mean(
-            clipped_proximal_ratio.detach(), loss_mask
+            clipped_proximal_ratio.detach(), metrics_mask
         ),
         "actor/clip_fraction": clip_fraction,
         "actor/dual_clip_fraction": dual_clip_fraction,
@@ -239,7 +272,6 @@ def compute_ppo_actor_loss(
         "advantages must be float32 to keep numerical stability"
     )
 
-    loss_mask_count = loss_mask.count_nonzero() or 1
     # For numerical stability.
     log_ratio = logprobs - old_logprobs
     if clip_log_ratio_min is not None:
@@ -274,8 +306,13 @@ def compute_ppo_actor_loss(
     clip_mask = policy_loss1.detach() < policy_loss2.detach()
     dual_clip_mask = (dual_clip_mask * loss_mask).bool()
 
-    clip_fraction = (clip_mask * loss_mask).sum() / float(loss_mask_count)
-    approx_kl = -torch.sum(approx_kl) / float(loss_mask_count)
+    # Both numerators broadcast over the trailing action dim under token_level,
+    # so they are normalized by the expanded count rather than loss_mask_count.
+    metrics_mask = _metrics_mask(ratio, loss_mask)
+    metrics_mask_count = metrics_mask.count_nonzero() or 1
+
+    clip_fraction = (clip_mask * metrics_mask).sum() / float(metrics_mask_count)
+    approx_kl = -torch.sum(approx_kl) / float(metrics_mask_count)
 
     dual_cliped_ratio = torch.where(dual_clip_mask, ratio, 0)
 
@@ -283,17 +320,11 @@ def compute_ppo_actor_loss(
         policy_loss = torch.tensor(0.0, device=policy_loss.device)
 
     # Compile metrics for logging
-    loss_mask_for_metrics = loss_mask
+    loss_mask_for_metrics = metrics_mask
     ratio_for_metrics = ratio.detach()
     ratio_abs_for_metrics = (ratio - 1).abs().detach()
     clipped_ratio_for_metrics = clipped_ratio.detach()
     dual_cliped_ratio_for_metrics = dual_cliped_ratio.detach()
-
-    # Only broadcast when ratio has action_dim dimension and loss_mask's last dim is 1
-    # This handles token_level mode: ratio [bsz, num_chunks, action_dim], loss_mask [bsz, num_chunks, 1]
-    if len(ratio.shape) > 2 and loss_mask.shape[-1] == 1 and ratio.shape[-1] > 1:
-        # Broadcast loss_mask to match ratio's shape for metrics computation
-        loss_mask_for_metrics = loss_mask.expand_as(ratio)
 
     metrics_data = {
         "actor/policy_loss": policy_loss.detach(),
