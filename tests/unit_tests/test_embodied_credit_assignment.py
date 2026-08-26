@@ -50,7 +50,9 @@ def _rollout(reward_coef: float):
     rewards = torch.zeros(CHUNK_STEPS, GROUP_SIZE, NUM_ACTION_CHUNKS)
     rewards[-1, WINNER, -1] = reward_coef  # env: reward_coef * terminations
 
-    dones = torch.zeros(CHUNK_STEPS + 1, GROUP_SIZE, NUM_ACTION_CHUNKS, dtype=torch.bool)
+    dones = torch.zeros(
+        CHUNK_STEPS + 1, GROUP_SIZE, NUM_ACTION_CHUNKS, dtype=torch.bool
+    )
     dones[-1, :, -1] = True  # every episode ends at the horizon
 
     return rewards, dones
@@ -102,9 +104,7 @@ def _logprob_grad(advantages: torch.Tensor) -> torch.Tensor:
         "an unchanged policy must give an importance ratio of exactly 1"
     )
     loss.backward()
-    return logprobs.grad.reshape(
-        CHUNK_STEPS, GROUP_SIZE, NUM_ACTION_CHUNKS, ACTION_DIM
-    )
+    return logprobs.grad.reshape(CHUNK_STEPS, GROUP_SIZE, NUM_ACTION_CHUNKS, ACTION_DIM)
 
 
 def test_success_outscores_its_group():

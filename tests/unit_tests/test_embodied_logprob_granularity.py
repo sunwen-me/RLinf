@@ -36,6 +36,7 @@ import math
 
 import pytest
 import torch
+
 from rlinf.algorithms.utils import preprocess_loss_inputs
 
 NUM_ACTION_CHUNKS = 10
@@ -80,9 +81,7 @@ def _ratio_error(logprob_type: str, sigma: float, seed: int = 0) -> torch.Tensor
 def test_mismatch_grows_as_sqrt_of_the_dimensions_summed(logprob_type):
     measured = _ratio_error(logprob_type, SIGMA_PER_DIM).mean().item()
     expected = (
-        math.sqrt(2.0 / math.pi)
-        * math.sqrt(DIMS_SUMMED[logprob_type])
-        * SIGMA_PER_DIM
+        math.sqrt(2.0 / math.pi) * math.sqrt(DIMS_SUMMED[logprob_type]) * SIGMA_PER_DIM
     )
     assert measured == pytest.approx(expected, rel=0.05)
 
