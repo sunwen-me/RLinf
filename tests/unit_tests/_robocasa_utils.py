@@ -12,24 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Access ``rlinf/envs/robocasa/utils.py`` without importing its package.
+"""Access RoboCasa helper modules without importing their package.
 
 ``rlinf.envs.robocasa.__init__`` eagerly imports ``RobocasaEnv``, which pulls in
 the simulator stack (legacy ``gym``, robosuite). The helpers re-exported here are
-plain NumPy, so the RoboCasa contract tests load the module straight from its
+plain NumPy, so the RoboCasa contract tests load each module straight from its
 path and keep running on the dependency-light CPU CI runner.
 """
 
 import importlib.util
 from pathlib import Path
 
-_UTILS_PATH = (
-    Path(__file__).resolve().parents[2] / "rlinf" / "envs" / "robocasa" / "utils.py"
-)
+_ROBOCASA_DIR = Path(__file__).resolve().parents[2] / "rlinf" / "envs" / "robocasa"
 
-_spec = importlib.util.spec_from_file_location("robocasa_utils", _UTILS_PATH)
-_utils = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_utils)
+
+def _load(module_name: str):
+    """Import ``rlinf/envs/robocasa/<module_name>.py`` by path."""
+    spec = importlib.util.spec_from_file_location(
+        f"robocasa_{module_name}", _ROBOCASA_DIR / f"{module_name}.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_utils = _load("utils")
+_task_progress = _load("task_progress")
 
 ROBOCASA_BASE_STATE_DIM = _utils.ROBOCASA_BASE_STATE_DIM
 ROBOCASA_BASE_STATES = _utils.ROBOCASA_BASE_STATES
@@ -41,6 +49,8 @@ assign_task_ids = _utils.assign_task_ids
 check_state_space = _utils._check_state_space
 get_state_ids = _utils.get_state_ids
 get_state_space = _utils.get_state_space
+compute_task_progress = _task_progress.compute_task_progress
+shaped_potential = _task_progress.shaped_potential
 
 __all__ = [
     "ROBOCASA_BASE_STATES",
@@ -51,6 +61,8 @@ __all__ = [
     "STATE_SPACE_STR_MAPPING",
     "assign_task_ids",
     "check_state_space",
+    "compute_task_progress",
+    "shaped_potential",
     "get_state_ids",
     "get_state_space",
 ]
