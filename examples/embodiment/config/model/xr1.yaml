@@ -17,6 +17,14 @@ action_dim: 7
 # LoRA settings
 is_lora: False
 lora_rank: 4
+# Scope of the adapters. `null` uses the shared suffix list in
+# `rlinf.models.get_model`, which would also adapt the frozen Qwen3-VL backbone
+# and would miss the action expert's fused `qkv_proj`. A string is matched
+# against every module path with `re.fullmatch`, so this regex keeps LoRA inside
+# the DiT; the 36 blocks contribute 180 adapted linears (24.8M parameters at
+# rank 32, 0.49% of the 5.05B checkpoint):
+#   ".*dit\\..*(qkv_proj|o_proj|gate_proj|up_proj|down_proj)"
+lora_target_modules: null
 
 # Number of Euler steps of the rectified-flow action head. Must match the
 # checkpoint's training recipe; XR-1 ships with 5.

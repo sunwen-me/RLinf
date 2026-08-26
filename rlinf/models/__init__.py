@@ -365,28 +365,39 @@ def get_model(cfg: DictConfig):
         from peft import LoraConfig, PeftModel, get_peft_model
 
         if not hasattr(cfg, "lora_path") or cfg.lora_path is None:
+            default_target_modules = [
+                "proj",
+                "qkv",
+                "fc1",
+                "fc2",  # vision
+                "q",
+                "kv",
+                "fc3",
+                "out_proj",  # project
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+                "lm_head",  # llm
+            ]
+            # ``model.lora_target_modules`` lets a model scope its own adapters.
+            # A string is handed to ``peft`` unchanged and matched against every
+            # module path with ``re.fullmatch``, which is how XR-1 keeps LoRA
+            # inside its action expert instead of reviving the frozen VLM; a
+            # list replaces the default suffix list above.
+            target_modules = cfg.get("lora_target_modules", None)
+            if target_modules is None:
+                target_modules = default_target_modules
+            elif not isinstance(target_modules, str):
+                target_modules = list(target_modules)
             lora_config = LoraConfig(
                 r=cfg.lora_rank,
                 lora_alpha=cfg.lora_rank,
                 lora_dropout=0.0,
-                target_modules=[
-                    "proj",
-                    "qkv",
-                    "fc1",
-                    "fc2",  # vision
-                    "q",
-                    "kv",
-                    "fc3",
-                    "out_proj",  # project
-                    "q_proj",
-                    "k_proj",
-                    "v_proj",
-                    "o_proj",
-                    "gate_proj",
-                    "up_proj",
-                    "down_proj",
-                    "lm_head",  # llm
-                ],
+                target_modules=target_modules,
                 init_lora_weights="gaussian",
             )
             if SupportedModel(model_type) in (
@@ -399,7 +410,15 @@ def get_model(cfg: DictConfig):
                 tag_vlm_subtree(module_to_lora, True)
                 model.paligemma_with_expert.paligemma = module_to_lora
             else:
-                model = get_peft_model(model, lora_config)
+                # ``autocast_adapter_dtype`` defaults to True, which builds the
+                # adapters in fp32.  FSDP then wraps every LoRA leaf (see the
+                # ``is_lora`` branch of ``get_fsdp_wrap_policy``) and casts its
+                # compute parameter to ``mixed_precision.param_dtype``, while
+                # peft still reads fp32 off the wrapper and casts the layer
+                # input to match -- an fp32 activation into a bf16 matmul, which
+                # raises "expected mat1 and mat2 to have the same dtype".
+                # Building the adapters in the base dtype keeps both sides equal.
+                model = get_peft_model(model, lora_config, autocast_adapter_dtype=False)
         else:
             model = PeftModel.from_pretrained(model, cfg.lora_path, is_trainable=True)
 
@@ -407,7 +426,38 @@ def get_model(cfg: DictConfig):
             for param in model.value_head.parameters():
                 param.requires_grad = True
 
+        log_lora_census(model)
+
     return model
+
+
+def log_lora_census(model) -> None:
+    """Log what the adapters landed on, after ``peft`` has wrapped ``model``.
+
+    A policy's own trainable-parameter census runs in its ``__init__``, which
+    is before ``get_peft_model`` re-freezes the base weights, so a LoRA run
+    otherwise records only the pre-adapter count. That makes a mis-scoped
+    ``lora_target_modules`` invisible until the reward curve comes out flat.
+    """
+    from rlinf.utils.logging import get_logger
+
+    logger = get_logger()
+    if logger is None:
+        return
+    adapted = {
+        name.rsplit(".lora_A", 1)[0]
+        for name, _ in model.named_modules()
+        if ".lora_A" in name
+    }
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    logger.info(
+        "LoRA census: adapted_modules=%d trainable_params=%d / total_params=%d (%.3f%%)",
+        len(adapted),
+        trainable,
+        total,
+        100.0 * trainable / max(total, 1),
+    )
 
 
 def tag_vlm_subtree(model, is_vlm: bool):
