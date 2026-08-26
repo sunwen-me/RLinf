@@ -24,6 +24,7 @@ from typing import Any, Callable, Optional, Union
 import gymnasium as gym
 import numpy as np
 
+from rlinf.envs.robocasa.task_progress import compute_task_progress
 from rlinf.envs.venv import (
     BaseVectorEnv,
     CloudpickleWrapper,
@@ -33,6 +34,18 @@ from rlinf.envs.venv import (
     SubprocVectorEnv,
     _setup_buf,
 )
+
+
+def _progress_value(env) -> float:
+    """Continuous task progress for ``env``, or NaN when the task exposes none.
+
+    RoboCasa returns no reward, so the wrapper synthesises one from
+    ``_check_success``.  ``compute_task_progress`` recovers the continuous fixture
+    state that success thresholds, which only the process owning ``env.sim`` can
+    read -- hence computing it here rather than in ``RobocasaEnv``.
+    """
+    progress = compute_task_progress(env)
+    return float("nan") if progress is None else float(progress)
 
 
 def _worker(
@@ -98,6 +111,9 @@ def _worker(
                 # call get_ep_meta() to get the RoboCasa env meta, includes prompt & layout_id, etcs
                 if hasattr(env, "get_ep_meta"):
                     env_return = get_ep_meta(env, env_return)
+                # Record the continuous progress toward success alongside the bit
+                # itself, so the wrapper can shape and log a graded signal.
+                env_return[-1]["task_progress"] = _progress_value(env)
                 p.send(env_return)
             elif cmd == "reset":
                 # Robosuite reset can return just obs or (obs, info)
@@ -118,6 +134,10 @@ def _worker(
                 # call get_ep_meta() to get the RoboCasa env meta, includes prompt & layout_id, etcs
                 if hasattr(env, "get_ep_meta"):
                     info = get_ep_meta(env, (info,))[-1]
+                # RoboCasa resets fixtures to a random partial state, so the
+                # wrapper needs the episode's starting progress to baseline the
+                # potential it shapes with.
+                info["task_progress"] = _progress_value(env)
                 # return obs + info other than mere obs
                 p.send((obs, info))
             elif cmd == "close":

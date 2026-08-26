@@ -20,6 +20,7 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 
+from rlinf.envs.robocasa.task_progress import shaped_potential
 from rlinf.envs.robocasa.utils import (
     OBS_KEY_CAMERA_NAME_MAPPING,
     OBS_KEY_ROBOCASA_IMAGE_MAPPING,
@@ -75,6 +76,11 @@ class RobocasaEnv(gym.Env):
 
         self.prev_step_reward = np.zeros(self.num_envs)
         self.use_rel_reward = cfg.use_rel_reward
+        # Weight on the continuous task-progress potential defined in
+        # ``rlinf/envs/robocasa/task_progress.py``.  The default of 0.0 keeps the
+        # sparse success bit that RoboCasa alone provides, so every existing
+        # config is unchanged.
+        self.progress_coef = float(cfg.get("progress_coef", 0.0))
 
         self._init_metrics()
         self._elapsed_steps = np.zeros(self.num_envs, dtype=np.int32)
@@ -244,6 +250,8 @@ class RobocasaEnv(gym.Env):
         self.success_once = np.zeros(self.num_envs, dtype=bool)
         self.fail_once = np.zeros(self.num_envs, dtype=bool)
         self.returns = np.zeros(self.num_envs)
+        self.task_progress = np.zeros(self.num_envs, dtype=np.float32)
+        self.progress_max = np.zeros(self.num_envs, dtype=np.float32)
 
     def _reset_metrics(self, env_idx=None):
         if env_idx is not None:
@@ -253,19 +261,31 @@ class RobocasaEnv(gym.Env):
             self.success_once[mask] = False
             self.fail_once[mask] = False
             self.returns[mask] = 0
+            self.task_progress[mask] = 0.0
+            self.progress_max[mask] = 0.0
             self._elapsed_steps[env_idx] = 0
         else:
             self.prev_step_reward[:] = 0
             self.success_once[:] = False
             self.fail_once[:] = False
             self.returns[:] = 0.0
+            self.task_progress[:] = 0.0
+            self.progress_max[:] = 0.0
             self._elapsed_steps[:] = 0
 
-    def _record_metrics(self, step_reward, terminations, infos):
+    def _record_metrics(self, step_reward, terminations, infos, task_progress=None):
         episode_info = {}
         self.returns += step_reward
         self.success_once = self.success_once | terminations
+        if task_progress is not None:
+            self.task_progress = task_progress
+            self.progress_max = np.maximum(self.progress_max, task_progress)
         episode_info["success_once"] = self.success_once.copy()
+        # Logged whatever ``progress_coef`` is: on a benchmark whose only reward is
+        # one bit per episode, a graded read-out resolves changes that a success
+        # rate at this sample size cannot.
+        episode_info["task_progress"] = self.task_progress.copy()
+        episode_info["progress_max"] = self.progress_max.copy()
         episode_info["return"] = self.returns.copy()
         episode_info["episode_len"] = self.elapsed_steps.copy()
         episode_info["reward"] = episode_info["return"] / np.maximum(
@@ -428,8 +448,29 @@ class RobocasaEnv(gym.Env):
 
         obs = self._wrap_obs(raw_obs, info_list)
         self._reset_metrics(env_idx)
+        # RoboCasa resets drawers and knobs to a random partial state, so baseline
+        # the potential on that head start; otherwise the first differenced reward
+        # would pay out progress the policy never made.
+        initial_progress = self._extract_task_progress(info_list)
+        self.task_progress[env_idx] = initial_progress
+        self.progress_max[env_idx] = initial_progress
+        if self.progress_coef != 0.0:
+            self.prev_step_reward[env_idx] = self.progress_coef * initial_progress
         infos = {}
         return obs, infos
+
+    def _extract_task_progress(self, info_lists):
+        """Per-env task progress from the raw env infos, ``0.0`` where unavailable.
+
+        ``rlinf/envs/robocasa/venv.py`` reports NaN for task families with no
+        scalar progress signal.  NaN is mapped to a constant 0.0, which contributes
+        nothing to a differenced potential and leaves those tasks purely sparse.
+        """
+        progress = np.array(
+            [info.get("task_progress", np.nan) for info in info_lists],
+            dtype=np.float32,
+        )
+        return np.nan_to_num(progress, nan=0.0)
 
     def step(self, actions=None, auto_reset=True):
         if actions is None:
@@ -466,10 +507,11 @@ class RobocasaEnv(gym.Env):
         truncations = self._elapsed_steps >= self.cfg.max_episode_steps
         obs = self._wrap_obs(raw_obs, info_lists)
 
-        step_reward = self._calc_step_reward(terminations)
+        task_progress = self._extract_task_progress(info_lists)
+        step_reward = self._calc_step_reward(terminations, task_progress)
 
         infos = list_of_dict_to_dict_of_list(info_lists)
-        infos = self._record_metrics(step_reward, terminations, infos)
+        infos = self._record_metrics(step_reward, terminations, infos, task_progress)
         if self.ignore_terminations:
             infos["episode"]["success_at_end"] = to_tensor(terminations)
             terminations[:] = False
@@ -555,8 +597,16 @@ class RobocasaEnv(gym.Env):
         infos["_elapsed_steps"] = dones
         return obs, infos
 
-    def _calc_step_reward(self, terminations):
-        reward = self.cfg.reward_coef * terminations
+    def _calc_step_reward(self, terminations, task_progress=None):
+        # Potential-based shaping; see ``shaped_potential``.  A policy that gets
+        # part-way now outranks one that does nothing, while a success still pays
+        # strictly more for ``progress_coef <= reward_coef``.
+        reward = shaped_potential(
+            terminations,
+            task_progress,
+            reward_coef=self.cfg.reward_coef,
+            progress_coef=self.progress_coef,
+        )
         reward_diff = reward - self.prev_step_reward
         self.prev_step_reward = reward
 
