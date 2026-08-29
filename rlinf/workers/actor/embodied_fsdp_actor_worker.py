@@ -265,6 +265,22 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 mean_reward_in_group <= self.cfg.algorithm.rewards_upper_bound
             )  # [n_prompts]
 
+            # Every group landing outside the band masks the entire loss, and
+            # the masked means downstream then divide by zero: the step logs
+            # ``advantages_mean=nan`` with every actor metric at exactly 0.0 and
+            # applies no gradient at all.  Train on the unfiltered batch
+            # instead -- a batch the filter rejects wholesale is the degenerate
+            # case it has no opinion about, not a step to throw away silently.
+            if not bool(reward_filter_mask.any()):
+                self.logger.warning(
+                    f"Reward filter matched no group: bounds "
+                    f"[{self.cfg.algorithm.rewards_lower_bound}, "
+                    f"{self.cfg.algorithm.rewards_upper_bound}], group mean rewards "
+                    f"{[round(v, 4) for v in mean_reward_in_group.tolist()]}. "
+                    f"Training on the unfiltered batch."
+                )
+                reward_filter_mask = torch.ones_like(reward_filter_mask)
+
             # extend mask dimension
             reward_filter_mask = reward_filter_mask.repeat_interleave(
                 group_size
